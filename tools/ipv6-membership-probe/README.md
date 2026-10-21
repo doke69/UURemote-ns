@@ -1,49 +1,39 @@
-# Experimental IPv6 multicast membership probe 0.16
+# IPv6 multicast inventory 0.16 (read-only)
 
-Prepared for code review only. Not deployed or run. This is not an IPv6 stack.
+PR review found that the proposed multicast experiment cannot safely coordinate
+whole-list replacement with existing system clients. The active experiment is
+withdrawn, not repaired by adding more cache checks. No writable backend or
+runtime/compile-time enable option remains in this build.
 
-HOS23.0.1 only. The prior read-only tool observed wl0 with exactly one cached
-multicast address01:00:5e:00:00:01. The earlier six-datagram experiment saw all
-three IPv4 controls and no IPv6 frames. Neither result establishes where IPv6
-was dropped or that WLAN hardware lacks IPv6 support.
+## What this build does
 
-## Proposed experiment (requires separate owner authorization)
+On HOS23.0.1, A queries wlan:nd creator0 then driver129 once, at most16 records
+of0xb0 bytes. It prints validated interface names and inferred cached multicast
+MAC addresses, closes sessions, and stops. + exits. It writes its own report only.
+There is no interface open, multicast setter, BPF access, packet sender,
+recovery action, attempt marker, queue operation or system-module installation.
 
-- Read current interface list. Stop unless wl0's validated cached list exactly
-  matches the fixed one-entry baseline.
-- Obtain only that interface service; do not BringUp/Down, start communication,
-  consume RX/TX queues, change promiscuity or call unknown ioctls.
-- Prepare an independent BPF copy descriptor before changing membership.
-- Create one-shot/pending markers, append only33:33:00:00:00:01 while preserving
-  the existing IPv4 group, then verify cached-list readback.
-- Observe counters passively for at most60seconds. No UDP sender or telemetry.
-- On ordinary completion, cancellation, or detected capture failure, attempt
-  guarded restoration once. Only restore if cache exactly matches our temporary
-  two-entry list; never overwrite a concurrent different list.
-- Verify original cache before clearing pending state. Do not claim independent
-  firmware-state readback or successful IPv6 connectivity.
+The prior0.15 device observation contained one cached multicast MAC,
+01:00:5e:00:00:01, and no33:33 prefix. That cache is not independent hardware
+readback and does not establish where IPv6 traffic was dropped.
 
-Normal path has at most two filter-setting calls (append and restore).
-If interrupted, X offers one guarded restoration attempt per launch. Such a
-recovery is not automatically authorized by the original passive research;
-the operator must bound/authorize recovery separately. A process/system crash
-can leave a temporary list; closing the interface service does not auto-restore.
+## Review fixes
 
-## Important unresolved limits
+- Whole-list check/set/restore race: remove all mutation paths pending a proven
+  service-side ownership/serialization design.
+- Undurable markers: remove markers and the experiment they purported to protect.
+- Cleanup dependent on marker readability: remove that recovery mechanism.
+- Cache-only clearing after partial failure: no recovery or clearing code remains.
 
-Read/check/set/read is not atomic against other network-service clients.
-The guard reduces unintended replacement but cannot exclude races. Do not run
-with concurrent network reconfiguration. Cached membership can differ from
-firmware state; AP multicast delivery is a separate gate. Raw IPv6 transmission,
-neighbor discovery, addressing and ICE are not implemented or validated.
+These changes remove unsafe operations; they do not implement safe live writes
+or IPv6 connectivity. See DESIGN.md for the remaining research gates.
 
-## Build and review status
+## Build and deployment
 
-inspector.c and membership.inc compile with the installed libnx/devkitA64 toolchain.
-Local draft NRO compiled; no device validation and no deployment approval.
-build.sh provides a portable SDK-based build entry; that shell entry has not
-been executed in this work. Requires DEVKITPRO pointing to an existing SDK.
-Never include firmware modules, console backups, credentials or keys in this PR.
+build.sh requires an existing SDK via DEVKITPRO. The Windows SDK entry is built
+locally; the portable shell entry has not been executed here. Firmware, keys,
+console backups and user reports must never be included in this PR.
 
-This tool writes only its Inspector report and v016 attempt/recovery marker
-files on SD. It does not modify the UU streaming app, pairing, games or saves.
+This revision has not been deployed or device-verified. Stable UUv52 and the
+installed Inspector0.15 remain unchanged. Repeating the same inventory on the
+console is not needed for the current offline research.
