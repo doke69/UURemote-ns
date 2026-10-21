@@ -20,7 +20,13 @@ try {
     } elseif (-not (Test-Path -LiteralPath 'romfs/signing.key')) {
         throw 'Provide -Apk with your UU TV 3.5.0 APK path.'
     }
-    $cmakeExe = (Get-Command cmake -ErrorAction Stop).Source
+    $cmakeExe = (Get-Command cmake -ErrorAction SilentlyContinue).Source
+    if (-not $cmakeExe) {
+        $bundledCmake = Get-ChildItem (Join-Path $projectRoot '.tools') -Filter 'cmake.exe' -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($bundledCmake) { $cmakeExe = $bundledCmake.FullName }
+    }
+    if (-not $cmakeExe) { throw 'CMake not found: install CMake 3.21+ or place it under .tools/.' }
     $configure = @('-S', '.', '-B', 'build-nx', '-G', 'Ninja', '-DCMAKE_TOOLCHAIN_FILE=cmake/switch.cmake', '-DCMAKE_BUILD_TYPE=Release')
     $localNinja = Join-Path $projectRoot '.tools/ninja/ninja.exe'
     if (Test-Path -LiteralPath $localNinja) { $configure += "-DCMAKE_MAKE_PROGRAM=$($localNinja.Replace('\','/'))" }

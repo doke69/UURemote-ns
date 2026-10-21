@@ -1,13 +1,312 @@
 #include "client.hpp"
+#include "quality_rpc.hpp"
 #include "diagnostics.hpp"
 #include "event_queue.hpp"
+#include "turn_stream.hpp"
 #include "rtc_diagnostics.hpp"
 #include "rtc_signaling.hpp"
 #include "signal_pump.hpp"
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <cstdio>
+#include <chrono>
+#include <cerrno>
+#include <rtc/rtp.hpp>
 #include <stdexcept>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
+#ifdef __SWITCH__
+#include <switch.h>
+#include <unistd.h>
+#endif
 
 namespace uu {
+namespace {
+// RTP and RTX have independent SSRC/sequence spaces (RFC 4588). The stock
+// receiving session keeps one sequence counter; only feed the primary stream
+// into that counter, while preserving raw RTX for the assembler downstream.
+class PrimaryVideoRtcpSession final : public rtc::RtcpReceivingSession {
+    uint32_t primary_ = 0;
+    bool haveTransit_ = false, loggedReportFix_ = false;
+    uint32_t previousTransit_ = 0;
+    double jitter_ = 0;
+    static uint32_t read32(const uint8_t *p) {
+        return uint32_t(p[0])<<24 | uint32_t(p[1])<<16 | uint32_t(p[2])<<8 | p[3];
+    }
+  public:
+    void incoming(rtc::message_vector &messages, const rtc::message_callback &send) override {
+        rtc::message_vector primaryMessages;
+        for (const auto &message : messages) {
+            if (!message) continue;
+            const auto *data = reinterpret_cast<const uint8_t *>(message->data());
+            const auto size = message->size();
+            if (size < 8 || data[0]>>6 != 2) continue;
+            if (message->type == rtc::Message::Binary && size >= 12 && (data[1]&127) == 96) {
+                const auto ssrc = read32(data+8);
+                if (!primary_) {
+                    primary_=ssrc;
+                    initSeq(uint16_t(uint16_t(data[2])<<8 | data[3]));
+                    mProbation=0;
+                }
+                if (ssrc == primary_) {
+                    const auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    const uint32_t transit=uint32_t(ms*90)-read32(data+4);
+                    if(haveTransit_) {
+                        const int64_t delta=int32_t(transit-previousTransit_);
+                        jitter_+=(double(delta<0?-delta:delta)-jitter_)/16.0;
+                    }
+                    previousTransit_=transit;haveTransit_=true;
+                    primaryMessages.push_back(message);
+                }
+            } else if (message->type == rtc::Message::Control && primary_ &&
+                       ((data[1] == 200 && size >= 28) || data[1] == 201) && read32(data+4) == primary_) {
+                primaryMessages.push_back(message);
+            }
+        }
+        rtc::RtcpReceivingSession::incoming(primaryMessages,[this,&send](rtc::message_ptr message) {
+            if(message && message->type==rtc::Message::Control &&
+               message->size()>=rtc::RtcpRr::SizeWithReportBlocks(1)) {
+                auto *rr=reinterpret_cast<rtc::RtcpRr *>(message->data());
+                if(rr->header.payloadType()==201) {
+                    // Report the actual extended maximum: cycles in the upper
+                    // 16 bits, highest primary sequence in the lower 16 bits.
+                    rr->getReportBlock(0)->setSeqNo(mMaxSeq,uint16_t(mCycles>>16));
+                    rr->getReportBlock(0)->setJitter(uint32_t(jitter_));
+                    if(!loggedReportFix_) {diagnostic("rtcp-primary-feedback-corrected");loggedReportFix_=true;}
+                }
+            }
+            send(std::move(message));
+        });
+        // Keep the original packet order and both payload types for the next
+        // receiver. Only accounting is filtered; retransmissions are not lost.
+    }
+};
+std::string trim(std::string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return {};
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+std::string configValue(const std::string &wanted) {
+    std::ifstream file(
+#ifdef __SWITCH__
+        "sdmc:/switch/UURemote-ns/config.ini"
+#else
+        "config.ini"
+#endif
+    );
+    std::string line;
+    while (std::getline(file, line)) {
+        if (auto comment = line.find('#'); comment != std::string::npos)
+            line.erase(comment);
+        const auto equals = line.find('=');
+        if (equals == std::string::npos)
+            continue;
+        if (trim(line.substr(0, equals)) == wanted)
+            return trim(line.substr(equals + 1));
+    }
+    return {};
+}
+int configInt(const std::string &key, int fallback, int minimum, int maximum) {
+    const auto value = configValue(key);
+    if (value.empty())
+        return fallback;
+    try {
+        return std::clamp(std::stoi(value), minimum, maximum);
+    } catch (...) {
+        return fallback;
+    }
+}
+bool diagEnabled() {
+    const auto value = configValue("diag");
+    return !value.empty() && value != "0" && value != "off" && value != "no";
+}
+const char *transportLabel(const rtc::Candidate &local, const rtc::Candidate &remote) {
+    using Type = rtc::Candidate::Type;
+    if (local.type() == Type::Relayed || remote.type() == Type::Relayed)
+        return "TURN 中继";
+    if (local.type() == Type::Host && remote.type() == Type::Host)
+        return "局域网直连";
+    return "P2P 直连";
+}
+const char *protocolLabel(rtc::Candidate::TransportType type) {
+    using Type = rtc::Candidate::TransportType;
+    switch (type) {
+    case Type::Udp:
+        return "UDP";
+    case Type::TcpActive:
+    case Type::TcpPassive:
+    case Type::TcpSo:
+    case Type::TcpUnknown:
+        return "TCP";
+    default:
+        return "—";
+    }
+}
+bool privateCandidate(rtc::Candidate &candidate) {
+    candidate.resolve(rtc::Candidate::ResolveMode::Simple);
+    const auto address = candidate.address();
+    if (!address) return false;
+    if (candidate.family() == rtc::Candidate::Family::Ipv6) {
+        std::string a = *address;
+        std::transform(a.begin(), a.end(), a.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        return a.rfind("fc", 0) == 0 || a.rfind("fd", 0) == 0 || a.rfind("fe80:", 0) == 0;
+    }
+    unsigned a=0,b=0,c=0,d=0;
+    return std::sscanf(address->c_str(), "%u.%u.%u.%u", &a,&b,&c,&d) == 4 &&
+           (a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 169 && b == 254));
+}
+std::string candidateIdentity(rtc::Candidate candidate) {
+    if(!candidate.resolve(rtc::Candidate::ResolveMode::Simple)) return {};
+    if(!candidate.address() || !candidate.port()) return {};
+    return *candidate.address()+"|"+std::to_string(*candidate.port())+"|"+protocolLabel(candidate.transportType());
+}
+std::string selectedPath(rtc::Candidate local, rtc::Candidate remote, bool knownRemoteRelay) {
+    using Type = rtc::Candidate::Type;
+    const bool privateLocal = privateCandidate(local), privateRemote = privateCandidate(remote);
+    const bool relay = local.type() == Type::Relayed || remote.type() == Type::Relayed;
+    std::string path = relay ? "TURN 中继" : knownRemoteRelay ? "远端中继（端点匹配）" : privateLocal && privateRemote ? "私网地址直连" : "P2P 直连";
+    const auto family = remote.family();
+    path += family == rtc::Candidate::Family::Ipv6 ? " · IPv6" :
+            family == rtc::Candidate::Family::Ipv4 ? " · IPv4" : " · 地址族未知";
+    return path + " · " + protocolLabel(local.transportType());
+}
+std::string endpoint(rtc::Candidate candidate) {
+    candidate.resolve(rtc::Candidate::ResolveMode::Simple);
+    const auto address=candidate.address();
+    const auto port=candidate.port();
+    std::string result=address.value_or("未知地址");
+    if (candidate.family()==rtc::Candidate::Family::Ipv6) result="["+result+"]";
+    if (port) result+=":"+std::to_string(*port);
+    using Type=rtc::Candidate::Type;
+    const char *type=candidate.type()==Type::Host ? "host" : candidate.type()==Type::ServerReflexive ? "srflx" :
+                     candidate.type()==Type::PeerReflexive ? "prflx" : candidate.type()==Type::Relayed ? "relay" : "unknown";
+    return result+" ["+type+"]";
+}
+void recordSelectedPath(const std::string &summary) {
+    if (!diagEnabled()) return;
+#ifdef __SWITCH__
+    const std::string dir="sdmc:/switch/UURemote-ns/diag";
+    mkdir(dir.c_str(),0777);
+#else
+    const std::string dir="diag";
+#ifdef _WIN32
+    _mkdir(dir.c_str());
+#else
+    mkdir(dir.c_str(),0777);
+#endif
+#endif
+    std::ofstream file(dir+"/selected_path.txt");
+    file << summary;
+}
+void saveQuality(int width, int height, int fps, int quality, bool vsync, int playoutDelay, int maxBitrateMbps, bool hevc) {
+#ifdef __SWITCH__
+    const std::string path = "sdmc:/switch/UURemote-ns/config.ini";
+#else
+    const std::string path = "config.ini";
+#endif
+    std::ifstream input(path);
+    std::string line, retained;
+    while (std::getline(input, line)) {
+        const auto key = trim(line.substr(0, line.find('=')));
+        if (key != "width" && key != "height" && key != "fps" && key != "quality" && key != "vsync" &&
+            key != "playout_delay_ms" && key != "frame_pacing" && key != "max_bitrate_mbps" && key != "video_codec") retained += line + '\n';
+    }
+    input.close();
+    std::ofstream output(path + ".quality-tmp", std::ios::trunc);
+    output << retained << "width=" << width << "\nheight=" << height << "\nfps=" << fps << "\nquality=" << quality << '\n';
+    output << "vsync=" << (vsync ? 1 : 0) << '\n';
+    output << "frame_pacing=1\nplayout_delay_ms=" << playoutDelay << '\n';
+    output << "max_bitrate_mbps=" << maxBitrateMbps << '\n';
+    output << "video_codec=" << (hevc?"hevc":"h264") << '\n';
+    output.close();
+    if (!output) throw std::runtime_error("画质设置保存失败");
+    const auto backup = path + ".before-quality-" + std::to_string(nowMs());
+    std::ifstream existing(path);
+    const bool hadConfig = bool(existing);
+    existing.close();
+    if (hadConfig && std::rename(path.c_str(), backup.c_str()) != 0)
+        throw std::runtime_error("画质设置保存失败");
+    if (std::rename((path + ".quality-tmp").c_str(), path.c_str()) != 0) {
+        if (hadConfig) std::rename(backup.c_str(), path.c_str());
+        throw std::runtime_error("画质设置保存失败，已尝试恢复原配置");
+    }
+}
+} // namespace
+void Client::saveIceDiagnostics() {
+    if(!diagEnabled() || !iceDiagnostics_.is_object()) return;
+    try {
+#ifdef __SWITCH__
+        const std::string dir="sdmc:/switch/UURemote-ns/diag";
+        mkdir(dir.c_str(),0777);
+#else
+        const std::string dir="diag";
+#ifdef _WIN32
+        _mkdir(dir.c_str());
+#else
+        mkdir(dir.c_str(),0777);
+#endif
+#endif
+        std::ofstream file(dir+"/ice_candidates.json");
+        if(file) file << iceDiagnostics_.dump(2);
+    } catch(...) { diagnostic("ice-diagnostics-unavailable"); }
+}
+void Client::recordIceCandidate(const char *direction, const char *stage, rtc::Candidate candidate) {
+    // Keep relay correlation even when detailed diagnostics are disabled.
+    if(std::string(direction)=="remote" && candidate.type()==rtc::Candidate::Type::Relayed) {
+        const auto identity=candidateIdentity(candidate);
+        if(!identity.empty()) remoteRelayEndpoints_.insert(identity);
+    }
+    if(!diagEnabled() || !iceDiagnostics_.is_object()) return;
+    try {
+        // Record only parsed numeric endpoints and public ICE attributes.
+        // Never dump the signaling object, candidate tail, ufrag, or password.
+        candidate.resolve(rtc::Candidate::ResolveMode::Simple);
+        auto &entries=iceDiagnostics_["candidates"];
+        const auto address=endpoint(candidate);
+        for(auto &entry:entries) {
+            if(entry["direction"]==direction && entry["endpoint"]==address &&
+               entry["priority"]==candidate.priority()) {
+                auto &stages=entry["stages"];
+                if(std::find(stages.begin(),stages.end(),Json(stage))==stages.end()) {
+                    stages.push_back(stage); saveIceDiagnostics();
+                }
+                return;
+            }
+        }
+        if(entries.size()>=256) {iceDiagnostics_["truncated"]=true;return;}
+        entries.push_back({{"direction",direction},{"endpoint",address},{"priority",candidate.priority()},
+                           {"address",candidate.address().value_or("")},{"port",candidate.port().value_or(0)},
+                           {"candidate_type",int(candidate.type())},
+                           {"resolved",candidate.isResolved()},{"private_address",privateCandidate(candidate)},
+                           {"protocol",protocolLabel(candidate.transportType())},
+                           {"stages",Json::array({stage})}});
+        saveIceDiagnostics();
+    } catch(...) {diagnostic("ice-candidate-diagnostic-unavailable");}
+}
 Client::Client(std::string key, std::string client, std::shared_ptr<Media> media) : media_(std::move(media)) {
+    streamWidth_ = configInt("width", 1280, 320, 1920);
+    streamHeight_ = configInt("height", 720, 180, 1080);
+    streamFps_ = configInt("fps", 60, 30, 60);
+    streamQuality_ = configInt("quality", 3, 1, 5);
+    maxBitrateMbps_=configInt("max_bitrate_mbps",0,0,50);
+    state_.maxBitrateMbps=maxBitrateMbps_;
+    hevc_=configValue("video_codec")=="hevc";state_.hevc=hevc_;
+    keyframeIntervalMs_ = configInt("keyframe_interval_ms", 4000, 0, 60000);
+    rtxEnabled_ = configInt("rtx", 1, 0, 1) != 0;
+    state_.width = streamWidth_; state_.height = streamHeight_; state_.fps = streamFps_; state_.quality = streamQuality_;
+    state_.vsync = configInt("vsync",1,0,1) != 0;
+    state_.playoutDelayMs = configInt("playout_delay_ms",35,0,100);
+    autoReconnect_=configInt("auto_reconnect",1,0,1)!=0;
+    reconnectLimit_=configInt("reconnect_attempts",5,1,10);
     api_ = std::make_unique<Api>(std::move(key), std::move(client), cancel_);
     worker_ = std::thread([this] { run(); });
 }
@@ -40,13 +339,10 @@ void Client::command(const std::string &name, Json data) {
     post(name, std::move(data));
 }
 void Client::drainEvents() {
-    drainEventBatch(
-        inbox_->events, inbox_->mutex, [this] { return stop_.load(); },
-        [this](const Event &e) {
-            if (e.generation && e.generation != generation_)
-                return;
-            handle(e);
-        });
+    drainEventBatch(inbox_->events,inbox_->mutex,[this]{return stop_.load();},[this](const Event &e){
+        if(e.generation && e.generation!=generation_) return;
+        handle(e);
+    });
 }
 void Client::run() {
     while (!stop_) {
@@ -59,6 +355,46 @@ void Client::run() {
             drainEvents();
             if (stop_)
                 break;
+            if(reconnectAt_ && monotonicMs()>=reconnectAt_ && !cancel_) {
+                reconnectAt_=0;
+                if(reconnectArmed_ && api_->authenticated())
+                    post("retry-connect",{{"deviceId",connectedDeviceId_}},generation_);
+            }
+            if(connectedSince_ && monotonicMs()-connectedSince_>=30000) {
+                reconnectAttempts_=0;connectedSince_=0;
+            }
+            tickQuality();
+            if (strictVideo_)
+                strictVideo_->tick();
+            // Ask the sender for a new IDR frame when the decoder lost
+            // references, when the picture stalled, or periodically as an
+            // anti-corruption safety net on lossy Wi-Fi links.
+            if (video_ && snapshot().streaming) {
+                const auto now = monotonicMs();
+                if (now - lastKeyframeRequest_ >= 700) {
+                    const bool requested = media_->takeKeyframeRequest();
+                    if (requested && strictVideo_)
+                        strictVideo_->requestRecovery();
+                    const bool stalled = media_->frameAgeMs() > 1500;
+                    const bool periodic =
+                        keyframeIntervalMs_ > 0 && now - lastKeyframeRequest_ >= keyframeIntervalMs_;
+                    if (requested || stalled || periodic) {
+                        video_->requestKeyframe();
+                        lastKeyframeRequest_ = now;
+                        ++keyframeRequests_;
+                        pendingKeyframeAt_ = now;
+                        keyframeCountAtRequest_ = media_->keyframeCount();
+                        diagnostic(requested ? "rtc-keyframe-media"
+                                             : stalled ? "rtc-keyframe-stall" : "rtc-keyframe-periodic");
+                    }
+                }
+            }
+            if (pendingKeyframeAt_ && media_->keyframeCount() != keyframeCountAtRequest_) {
+                lastKeyframeRecoveryMs_ = int(monotonicMs() - pendingKeyframeAt_);
+                pendingKeyframeAt_ = 0;
+            }
+            if (monotonicMs() - lastStatsUpdate_ >= 500)
+                refreshStats(monotonicMs());
             if (socket_) {
                 pumpSignaling(
                     [this](WsMessage &m) {
@@ -104,10 +440,23 @@ void Client::run() {
             if (cancel_) {
                 cancel_ = false;
                 setState("idle", "已取消");
-            } else
-                setState("error", failure);
+            } else {
+                const bool transient=reason=="failure-connect-timeout" || reason=="failure-signal-heartbeat" ||
+                    reason=="failure-signal-read" || reason=="failure-signal-remote-close" ||
+                    reason=="failure-signal-write-timeout" || reason=="failure-signal-write" ||
+                    reason=="failure-peer-disconnected" || reason=="failure-ice" || reason=="failure-dtls-or-sctp";
+                if(autoReconnect_ && reconnectArmed_ && api_->authenticated() && transient &&
+                   reconnectAttempts_<reconnectLimit_ && !connectedDeviceId_.empty()) {
+                    const int delay=std::min(16000,1000<<std::min(reconnectAttempts_,4));
+                    ++reconnectAttempts_;reconnectAt_=monotonicMs()+delay;
+                    diagnostic(("auto-reconnect-scheduled-"+std::to_string(reconnectAttempts_)).c_str());
+                    setState("reconnecting",std::to_string(delay/1000)+" 秒后重新连接（"+
+                        std::to_string(reconnectAttempts_)+"/"+std::to_string(reconnectLimit_)+"），B 取消");
+                } else {reconnectAt_=0;setState("error",failure);}
+            }
         } catch (...) {
             diagnostic("client-unknown-exception");
+            reconnectAt_=0;reconnectArmed_=false;
             disconnect();
             cancel_ = false;
             setState("error", "发生异常，连接阶段已写入 connection.log");
@@ -119,7 +468,94 @@ void Client::run() {
 void Client::handle(const Event &event) {
     const auto &e = event.type;
     const auto &data = event.data;
-    if (e == "login") {
+    if(e=="disconnect" || e=="cancel" || e=="logout" || e=="login" || e=="sms-open") {
+        reconnectArmed_=false;reconnectAt_=0;reconnectAttempts_=0;
+    }
+    if(e=="quality-screens") {
+        const int screen=data.at("screen").get<int>();
+        if(screen!=activeScreenId_){
+            activeScreenId_=screen;
+            diagnostic(("quality-current-screen-"+std::to_string(screen)+"-count-"+std::to_string(data.at("count").get<unsigned>())).c_str());
+            if(pendingQuality_ && pendingQuality_->screenId!=screen)
+                fallbackQuality("电脑屏幕已变化，正在重新连接…");
+        }
+    } else if (e == "quality-settings") {
+        const int width = data.at("width").get<int>(), height = data.at("height").get<int>();
+        const int fps = data.at("fps").get<int>(), quality = data.at("quality").get<int>();
+        if (!((width == 960 && height == 540) || (width == 1280 && height == 720) ||
+              (width == 1920 && height == 1080)) || (fps != 30 && fps != 60) || quality < 1 || quality > 5)
+            throw std::runtime_error("画质设置无效");
+        const bool vsync = data.value("vsync",true);
+        const int playoutDelay=data.value("playout_delay_ms",state_.playoutDelayMs);
+        if(playoutDelay<0 || playoutDelay>100) throw std::runtime_error("播放缓冲设置无效");
+        const int maxBitrate=data.value("max_bitrate_mbps",maxBitrateMbps_);
+        if(maxBitrate<0 || maxBitrate>50) throw std::runtime_error("码率上限设置无效");
+        const bool hevc=data.value("hevc",hevc_);
+        if(pendingQuality_){std::lock_guard lock(stateMutex_);state_.qualityNotice="正在更新画质，请稍候";return;}
+        const QualityValues target{width,height,fps,quality,maxBitrate,playoutDelay,vsync,hevc};
+        const bool captureChanged=width!=streamWidth_ || height!=streamHeight_ || fps!=streamFps_ || quality!=streamQuality_;
+        const bool capChanged=maxBitrate!=maxBitrateMbps_;
+        const bool streamChanged=captureChanged || capChanged || hevc!=hevc_;
+        if(!peer_ || (!snapshot().streaming && !streamChanged)){commitQuality(target,false,"设置已保存，连接时应用");return;}
+        if(!snapshot().streaming){reconnectQuality(target,"正在重新连接以应用设置…");return;}
+        if(hevc!=hevc_ || (capChanged && maxBitrate==0) || (capChanged && !rembAvailable_)){
+            reconnectQuality(target,"正在重新连接以应用编码或码率设置…");return;
+        }
+        if(!captureChanged){
+            try{commitQuality(target,capChanged,streamChanged?"码率反馈已在线更新":"显示设置已更新");}
+            catch(...){reconnectQuality(target,"在线更新未完成，正在重连应用…");}
+            return;
+        }
+        const auto it=channels_.find("TEXT_DATA_CHANNEL");
+        if(it==channels_.end() || !it->second->isOpen() || it->second->bufferedAmount()>65536){
+            reconnectQuality(target,"设置通道尚未就绪，正在重连应用…");return;
+        }
+        if(activeScreenId_<0){
+            diagnostic("quality-current-screen-unavailable");
+            reconnectQuality(target,"尚未收到电脑屏幕信息，正在重连应用…");return;
+        }
+        const auto id=nextQualityRpc_++;
+        const auto bytes=captureSettingsRpc(id,width,height,fps,quality,activeScreenId_);
+        pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,activeScreenId_};
+        {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在等待电脑确认画质…";}
+        try{
+            if(!it->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size())){
+                fallbackQuality("设置发送受阻，正在重连应用…");return;
+            }
+            ++qualitySent_;diagnostic(("quality-rpc-sent-"+std::to_string(id)).c_str());
+        }catch(...){fallbackQuality("设置发送失败，正在重连应用…");}
+    } else if(e=="quality-rpc-ack") {
+        if(!pendingQuality_ || pendingQuality_->acknowledged || data.at("id").get<uint64_t>()!=pendingQuality_->id)return;
+        const bool capture=data.value("capture",false);
+        const auto errors=data.value("errors",0u),other=data.value("other",0u);
+        lastQualityCode_=data.value("code",0);lastQualityErrors_=errors;
+        // Log only bounded numeric metadata, never remote strings or payloads.
+        diagnostic(("quality-rpc-response-capture-"+std::to_string(capture)+
+                    "-entries-"+std::to_string(data.value("entries",0u))+"-errors-"+std::to_string(errors)+"-code-"+std::to_string(data.value("code",0))+
+                    "-other-"+std::to_string(other)).c_str());
+        if(errors || other){
+            diagnostic("quality-rpc-response-not-accepted");
+            fallbackQuality("电脑未确认在线设置，正在重连应用…");return;
+        }
+        // Original CaptureSettingResp leaves errors empty when the optional
+        // capture body is absent. A matching header-only reply is an RPC
+        // acknowledgment, not evidence of actual encoder FPS or quality.
+        pendingQuality_->headerOnly=!capture;
+        ++qualityAcked_;pendingQuality_->acknowledged=true;pendingQuality_->deadline=monotonicMs()+5000;
+        diagnostic(("quality-rpc-acked-"+std::to_string(pendingQuality_->id)).c_str());
+        if(video_)video_->requestKeyframe();
+        finishQuality();
+    } else if(e=="startup"){
+        cancel_=false;
+        if(!api_->restoreSession()){post("login");return;}
+        {std::lock_guard lock(stateMutex_);state_.nickname=api_->nickname();state_.qrUrl.clear();}
+        setState("loading","正在恢复登录并同步设备…");
+        try{refresh();}
+        catch(...){
+            if(!api_->authenticated()){post("login");return;}
+            setState("idle","登录已保留，网络暂不可用；请刷新重试");
+        }
+    } else if (e == "login") {
         disconnect();
         cancel_ = false;
         {
@@ -190,7 +626,10 @@ void Client::handle(const Event &event) {
             refresh();
         } else
             setState("idle", "请先按 A 扫码登录");
-    } else if (e == "connect") {
+    } else if (e == "connect" || e=="retry-connect") {
+        if(e=="connect") {reconnectArmed_=true;reconnectAttempts_=0;reconnectAt_=0;}
+        else if(!reconnectArmed_) return;
+        connectedDeviceId_ = data.at("deviceId").get<std::string>();
         disconnect();
         cancel_ = false;
         setState("joining", "正在加入远控房间…");
@@ -206,6 +645,19 @@ void Client::handle(const Event &event) {
         socket_->open(url, room.at("token").get<std::string>());
         lastPacket_ = monotonicMs();
         deadline_ = monotonicMs() + 45000;
+    } else if(e=="system-action") {
+        auto inform=[&](const char *message){std::lock_guard lock(stateMutex_);state_.qualityNotice=message;qualityNoticeUntil_=monotonicMs()+6000;};
+        const auto channel=channels_.find("TEXT_DATA_CHANNEL");
+        if(!snapshot().streaming || channel==channels_.end() || !channel->second->isOpen() || channel->second->bufferedAmount()>65536){
+            inform("电脑控制通道尚未就绪，未发送操作");return;
+        }
+        const auto action=data.at("action").get<unsigned>();
+        const auto enabled=data.contains("enabled")?std::optional<bool>(data.at("enabled").get<bool>()):std::nullopt;
+        const auto bytes=simpleActionMessage(nextQualityRpc_++,action,enabled);
+        try {
+            if(channel->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size()))inform("操作请求已发送，请确认电脑端结果");
+            else inform("操作未发送：电脑控制通道繁忙");
+        }catch(...){inform("电脑控制操作发送失败");}
     } else if (e == "input") {
         input(data);
     } else if (e == "release") {
@@ -216,6 +668,7 @@ void Client::handle(const Event &event) {
         diagnostic(data.value("type", "") == "answer" ? "soac-answer-sent" : "soac-offer-sent");
     } else if (e == "candidate") {
         emit("soac", soac(remote_, "candidate", data, ice_, control_));
+        recordIceCandidate("local","sent",rtc::Candidate(data.at("candidate").get<std::string>(),"0"));
         diagnostic("soac-candidate-sent");
     } else if (e == "ice-state" || e == "gathering-state" || e == "signaling-state") {
         const auto label = "rtc-" + e + "-" + std::to_string(data.get<int>());
@@ -232,6 +685,15 @@ void Client::handle(const Event &event) {
         diagnostic(("rtc-peer-state-" + std::to_string(s)).c_str());
         if (s == int(rtc::PeerConnection::State::Connected)) {
             deadline_ = 0;
+            connectedSince_=monotonicMs();reconnectAt_=0;
+            applyBitrateCap();
+            if (video_ && video_->requestKeyframe()) {
+                lastKeyframeRequest_ = monotonicMs();
+                ++keyframeRequests_;
+                pendingKeyframeAt_ = lastKeyframeRequest_;
+                keyframeCountAtRequest_ = media_->keyframeCount();
+                diagnostic("rtc-keyframe-initial");
+            }
             setState("connected", "已连接 · 左摇杆移动鼠标 · ZR/ZL 点击 · − 断开");
         } else if (s == int(rtc::PeerConnection::State::Failed) ||
                    s == int(rtc::PeerConnection::State::Disconnected) ||
@@ -284,6 +746,7 @@ void Client::completeLogin(const Json &response) {
     }
     setState("loading", "登录成功，正在同步设备…");
     refresh();
+    if(!api_->sessionSaved())setState("idle","登录成功，但保存登录失败；下次打开需要重新登录");
 }
 void Client::refresh() {
     auto response = api_->request("GET", "/api/v1/device/list");
@@ -378,8 +841,12 @@ void Client::dispatch(const SioPacket &p) {
             if ((!remote_.is_string() && !remote_.is_number()) || remote_ == "")
                 throw std::runtime_error("房间内没有在线电脑");
             control_ = uuid();
-            auto options = connectOptions();
+            auto options = connectOptions(streamWidth_, streamHeight_, streamFps_, streamQuality_);
             options.insert(options.begin(), 4);
+            diagnostic(("stream-options-" + std::to_string(streamWidth_) + "x" +
+                        std::to_string(streamHeight_) + "-" + std::to_string(streamFps_) + "fps-q" +
+                        std::to_string(streamQuality_) + "-kf" + std::to_string(keyframeIntervalMs_))
+                           .c_str());
             setState("negotiating", "正在申请远控权限…");
             // Preserve room ICE configuration if control does not repeat it.
             ice_ = value.value("iceServers", Json::array());
@@ -406,11 +873,36 @@ void Client::dispatch(const SioPacket &p) {
     }
 }
 void Client::beginPeer(const Json &result) {
+    lastSelectedPath_.clear();
+    remoteRelayEndpoints_.clear();
+    recordSelectedPath("state=awaiting_selected_pair\n");
     auto servers = result.value("iceServers", ice_);
     remote_ = result.value("client_id", remote_);
     ice_ = result.at("ice_id");
     rtc::Configuration config;
     config.disableAutoNegotiation = true;
+    iceDiagnostics_={{"version",UU_VERSION},{"force_relay",result.value("force_relay",false)},
+                     {"candidates",Json::array()},{"path_history",Json::array()},{"truncated",false},
+                     {"route_policy",configInt("route_policy",1,0,1)?"ipv6-lan-public-relay":"rfc-default"}};
+#ifdef __SWITCH__
+    errno=0;
+    const int ipv6Socket=socket(AF_INET6,SOCK_DGRAM,0);
+    iceDiagnostics_["ipv6_udp_socket_available"]=ipv6Socket>=0;
+    if(ipv6Socket<0) iceDiagnostics_["ipv6_udp_socket_errno"]=errno;
+    else close(ipv6Socket);
+    u32 interfaceAddress=0,mask=0,gateway=0,dns1=0,dns2=0;
+    if(R_SUCCEEDED(nifmGetCurrentIpConfigInfo(&interfaceAddress,&mask,&gateway,&dns1,&dns2))) {
+        auto ipv4=[](u32 address) {
+            return std::to_string(address&255)+"."+std::to_string((address>>8)&255)+"."+
+                   std::to_string((address>>16)&255)+"."+std::to_string((address>>24)&255);
+        };
+        iceDiagnostics_["interface_ipv4"]=ipv4(interfaceAddress);
+        iceDiagnostics_["interface_mask"]=ipv4(mask);
+        const auto hostid=u32(gethostid());
+        iceDiagnostics_["gethostid_ipv4"]=ipv4(hostid);
+        iceDiagnostics_["gethostid_matches_interface"]=hostid==interfaceAddress;
+    }
+#endif
     if (result.value("force_relay", false))
         config.iceTransportPolicy = rtc::TransportPolicy::Relay;
     for (const auto &s : servers) {
@@ -426,6 +918,45 @@ void Client::beginPeer(const Json &result) {
             config.iceServers.push_back(std::move(server));
         }
     }
+    // libjuice's native TURN transport is UDP. Adapt only server types actually
+    // advertised by this authenticated room; never guess a TLS port or disable
+    // certificate validation. Direct ICE candidates remain unaffected.
+    using Relay=rtc::IceServer::RelayType;
+    std::array<int,3> available{};
+    auto relayIndex=[](Relay type){return type==Relay::TurnTls?2:type==Relay::TurnTcp?1:0;};
+    for(const auto &server:config.iceServers)
+        if(server.type==rtc::IceServer::Type::Turn) ++available[relayIndex(server.relayType)];
+    const auto requested=configValue("turn_transport");
+    int mode=requested=="tls"?2:requested=="tcp"?1:requested=="udp"?0:reconnectAttempts_%3;
+#ifndef __SWITCH__
+    mode=0;
+#endif
+    if(!available[mode]) {
+        mode=available[0]?0:available[1]?1:available[2]?2:0;
+        diagnostic("turn-transport-requested-mode-unavailable");
+    }
+    turnUplinkMode_=mode==2?"TLS":mode==1?"TCP":"UDP";
+    std::vector<rtc::IceServer> filtered;
+    for(auto server:config.iceServers) {
+        if(server.type==rtc::IceServer::Type::Stun) {filtered.push_back(std::move(server));continue;}
+        if(relayIndex(server.relayType)!=mode) continue;
+        if(mode!=0) {
+#ifdef __SWITCH__
+            if(turnBridges_.size()>=2) continue;
+            auto bridge=std::make_shared<TurnStreamBridge>(server.hostname,server.port?server.port:(mode==2?5349:3478),mode==2);
+            server.hostname="127.0.0.1";server.port=bridge->localPort();server.relayType=Relay::TurnUdp;
+            turnBridges_.push_back(std::move(bridge));
+#else
+            continue;
+#endif
+        }
+        filtered.push_back(std::move(server));
+    }
+    config.iceServers=std::move(filtered);
+    iceDiagnostics_["turn_server_transports_available"]={{"udp",available[0]},{"tcp",available[1]},{"tls",available[2]}};
+    iceDiagnostics_["turn_server_uplink"]=turnUplinkMode_;
+    iceDiagnostics_["ice_server_count"]=config.iceServers.size();
+    saveIceDiagnostics();
     setState("rtc-init", "正在初始化原生串流…");
     diagnostic("rtc-runtime");
     rtc::Preload();
@@ -455,33 +986,88 @@ void Client::beginPeer(const Json &result) {
         [post](rtc::PeerConnection::SignalingState s) { post("signaling-state", int(s)); });
     rtc::Description::Video v("0", rtc::Description::Direction::RecvOnly);
     diagnostic("rtc-video");
-    v.addH264Codec(96, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
-    v.setBitrate(5000);
+    // One codec per connection: RTX/PT and decoder must describe the same bitstream.
+    // HEVC is explicitly opt-in; H264 remains the default/manual fallback.
+    if(hevc_ && configValue("receiver")=="legacy")
+        throw std::runtime_error("H.265 需要严格接收器，请使用 H.264 或 receiver=strict");
+    if(hevc_) v.addH265Codec(96,"profile-id=1;tier-flag=0;level-id=123;tx-mode=SRST;sprop-max-don-diff=0");
+    else v.addH264Codec(96, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f");
+    diagnostic(hevc_?"video-codec-offered-hevc-main":"video-codec-offered-h264");
+    if (rtxEnabled_) {
+        v.addRtxCodec(97, 96, 90000);
+        diagnostic("rtc-video-rtx");
+    }
+    // Let the confirmed UU quality tier drive sender rate control. The former
+    // fixed SDP 5000 kbps declaration limited every tier with the same hint.
     video_ = peer_->addTrack(v);
-    auto depacketizer = std::make_shared<rtc::H264RtpDepacketizer>(rtc::NalUnit::Separator::StartSequence);
-    depacketizer->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
-    video_->setMediaHandler(depacketizer);
+    auto videoStats = std::make_shared<RtpTrackStats>(90000, "video", false);
+    auto videoSession = std::make_shared<PrimaryVideoRtcpSession>();
+    videoSession->addToChain(videoStats);
+    videoStats_ = videoStats;
     std::weak_ptr<Media> media = media_;
     auto mediaGeneration = media_->generation();
-    video_->onFrame([media, mediaGeneration](rtc::binary data, rtc::FrameInfo) {
+    const bool hevc=hevc_;
+    const bool strict = configValue("receiver") != "legacy";
+    if (strict) {
+        strictVideo_ = std::make_shared<StrictVideoReceiver>(rtxEnabled_,
+            configInt("receiver_deadline_ms", 600, 100, 1200),
+            [media, mediaGeneration, hevc](const uint8_t *data, size_t size, uint32_t timestamp) {
+                if (auto m = media.lock()) m->video(data, size, mediaGeneration, timestamp, hevc);
+            }, hevc);
+        strictVideo_->addToChain(videoSession);
+        video_->setMediaHandler(strictVideo_);
+        diagnostic("video-receiver-strict-v2");
+    } else {
+        const int jitterMs = configInt("jitter_ms", 120, 0, 400);
+        auto assembler = std::make_shared<VideoAssembler>(rtxEnabled_, jitterMs);
+        assembler->addToChain(videoSession);
+        video_->setMediaHandler(assembler);
+        videoAssembler_ = assembler;
+        diagnostic("video-receiver-legacy");
+    }
+    video_->onFrame([media, mediaGeneration, hevc](rtc::binary data, rtc::FrameInfo info) {
         if (auto m = media.lock())
-            m->video(reinterpret_cast<const uint8_t *>(data.data()), data.size(), mediaGeneration);
+            m->video(reinterpret_cast<const uint8_t *>(data.data()), data.size(), mediaGeneration, info.timestamp, hevc);
     });
     rtc::Description::Audio a("1", rtc::Description::Direction::RecvOnly);
     diagnostic("rtc-audio");
     a.addOpusCodec(111);
     audio_ = peer_->addTrack(a);
     auto opus = std::make_shared<rtc::OpusRtpDepacketizer>();
-    opus->addToChain(std::make_shared<rtc::RtcpReceivingSession>());
+    auto audioStats = std::make_shared<RtpTrackStats>(48000, "audio", false);
+    auto audioSession = std::make_shared<rtc::RtcpReceivingSession>();
+    opus->addToChain(audioSession);
+    audioSession->addToChain(audioStats);
     audio_->setMediaHandler(opus);
+    audioStats_ = audioStats;
     audio_->onFrame([media, mediaGeneration](rtc::binary data, rtc::FrameInfo) {
         if (auto m = media.lock())
             m->audio(reinterpret_cast<const uint8_t *>(data.data()), data.size(), mediaGeneration);
     });
     diagnostic("rtc-channels");
     for (const auto *label : {"CONTROL_DATA_CHANNEL", "TEXT_DATA_CHANNEL", "STREAMER_DATA_CHANNEL",
-                              "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL"})
-        channels_[label] = peer_->createDataChannel(label);
+                              "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL"}) {
+        auto channel=peer_->createDataChannel(label);channels_[label]=channel;
+        {
+            const bool acceptRpc=std::string(label)=="TEXT_DATA_CHANNEL" || std::string(label)=="FILE_DATA_CHANNEL";
+            std::weak_ptr<Inbox> inbox=inbox_;const auto generation=generation_;
+            channel->onMessage([inbox,generation,acceptRpc](rtc::message_variant message) {
+                const uint8_t *bytes=nullptr;size_t size=0;
+                if(auto *binary=std::get_if<rtc::binary>(&message)){bytes=reinterpret_cast<const uint8_t *>(binary->data());size=binary->size();}
+                else if(auto *text=std::get_if<std::string>(&message)){bytes=reinterpret_cast<const uint8_t *>(text->data());size=text->size();}
+                const auto screens=parseScreenSources(bytes,size);
+                const auto ack=acceptRpc?parseCaptureRpcAck(bytes,size):std::optional<CaptureRpcAck>{};
+                if(!screens && !ack)return;
+                if(auto queue=inbox.lock()){
+                    std::lock_guard lock(queue->mutex);
+                    if(queue->events.size()>=127)return;
+                    if(screens)queue->events.push_back({"quality-screens",{{"screen",screens->screenId},{"count",screens->count}},generation});
+                    if(ack)queue->events.push_back({"quality-rpc-ack",{{"id",ack->requestId},{"capture",ack->capture},{"errors",ack->errors},{"entries",ack->entries},{"code",ack->errorCode},{"other",ack->otherFields}},generation});
+                    queue->cv.notify_one();
+                }
+            });
+        }
+    }
     setState("connecting", "正在建立音视频通道…");
     diagnostic("rtc-offer");
     peer_->setLocalDescription();
@@ -499,34 +1085,143 @@ void Client::handleSoac(const Json &packet) {
             return;
     }
     const auto type = d.value("type", std::string{});
+    if(d.contains("sdp") && d["sdp"].is_string()) {
+        // Reject incompatible HEVC parameters before transport can deliver RTP.
+        // Only single-layer Main, SRST, no DONL is implemented in this version.
+        if(hevc_) {
+            std::istringstream codecLines(d["sdp"].get<std::string>());
+            std::string item;bool inVideo=false,matched=false;
+            while(std::getline(codecLines,item)) {
+                if(!item.empty() && item.back()=='\r') item.pop_back();
+                if(item.rfind("m=",0)==0) {
+                    inVideo=item.rfind("m=video ",0)==0;
+                    if(inVideo && item.rfind("m=video 0 ",0)==0)
+                        throw std::runtime_error("电脑拒绝 H.265，请在 L3 改回 H.264");
+                }
+                if(!inVideo) continue;
+                if(item=="a=rtpmap:96 H265/90000") matched=true;
+                if(item.rfind("a=fmtp:96 ",0)==0) {
+                    std::istringstream params(item.substr(10));std::string param;
+                    while(std::getline(params,param,';')) {
+                        param=trim(param);auto eq=param.find('=');
+                        if(eq==std::string::npos) continue;
+                        auto key=trim(param.substr(0,eq)),value=trim(param.substr(eq+1));
+                        if((key=="sprop-max-don-diff" && value!="0") ||
+                           (key=="profile-id" && value!="1") ||
+                           (key=="tx-mode" && value!="SRST"))
+                            throw std::runtime_error("电脑的 H.265 参数暂不支持，请改回 H.264");
+                    }
+                }
+            }
+            if(!matched) throw std::runtime_error("电脑未协商 H.265，请在 L3 改回 H.264");
+            diagnostic("video-codec-negotiated-hevc-main");
+        }
+        rembAvailable_=false;
+        std::istringstream feedbackLines(d["sdp"].get<std::string>());
+        std::string line;bool video=false;
+        while(std::getline(feedbackLines,line)) {
+            if(!line.empty() && line.back()=='\r') line.pop_back();
+            if(line.rfind("m=",0)==0) video=line.rfind("m=video ",0)==0;
+            if(video && (line=="a=rtcp-fb:96 goog-remb" || line=="a=rtcp-fb:* goog-remb")) rembAvailable_=true;
+        }
+    }
+    if (strictVideo_ && d.contains("sdp") && d["sdp"].is_string()) {
+        // Bind RTX to the negotiated FID pair when the sender supplies it.
+        std::istringstream lines(d["sdp"].get<std::string>());
+        std::string line;
+        bool inVideo = false;
+        while (std::getline(lines, line)) {
+            if (line.rfind("m=", 0) == 0) inVideo = line.rfind("m=video ", 0) == 0;
+            if (inVideo && line.rfind("a=ssrc-group:FID ", 0) == 0) {
+                std::istringstream pair(line.substr(17));
+                uint32_t primary = 0, rtx = 0;
+                if (pair >> primary >> rtx) strictVideo_->setSources(primary, rtx);
+            }
+        }
+    }
     if (type == "answer")
         diagnostic("soac-answer-received");
     else if (type == "offer" || type == "restart_ice")
         diagnostic("soac-offer-received");
     const auto result = applyRemoteSignal(*peer_, d, pendingCandidates_);
+    if(type=="candidate" && (result==RemoteSignal::CandidateApplied || result==RemoteSignal::CandidateQueued)) {
+        const auto &source=d.contains("candidate") && d["candidate"].is_object()?d["candidate"]:d;
+        recordIceCandidate("remote",result==RemoteSignal::CandidateApplied?"applied":"queued",
+                           rtc::Candidate(source.at("candidate").get<std::string>(),"0"));
+    }
+    if(result==RemoteSignal::Description) {
+        if(auto description=peer_->remoteDescription())
+            for(const auto &candidate:description->candidates()) recordIceCandidate("remote","description",candidate);
+    }
     if (result == RemoteSignal::Closed)
         diagnostic("soac-after-transport-close");
     else if (result == RemoteSignal::CandidateQueued)
         diagnostic("soac-candidate-queued");
     else if (result == RemoteSignal::CandidateApplied)
         diagnostic("soac-candidate-applied");
-    else if (result == RemoteSignal::Description)
+    else if (result == RemoteSignal::Description) {
         diagnostic("soac-description-applied");
+        if (!sdpDumpDone_ && diagEnabled() && peer_) {
+            if (auto description = peer_->remoteDescription()) {
+#ifdef _WIN32
+                _mkdir("diag");
+#else
+                mkdir("sdmc:/switch/UURemote-ns/diag", 0777);
+#endif
+                std::ofstream file(
+#ifdef __SWITCH__
+                    "sdmc:/switch/UURemote-ns/diag/sdp-remote.txt"
+#else
+                    "diag/sdp-remote.txt"
+#endif
+                );
+                if (file)
+                    file << std::string(*description);
+                sdpDumpDone_ = true;
+            }
+        }
+    }
 }
 void Client::input(const Json &data) {
     auto it = channels_.find("CONTROL_DATA_CHANNEL");
-    if (it == channels_.end() || !it->second->isOpen())
-        return;
     const auto action = data.value("action", std::string{});
+    if (it == channels_.end() || !it->second->isOpen()){
+        if(action=="touch_native")++touchFailures_;
+        gamepadConnected_=false;
+        return;
+    }
+    if(action=="touch_native"){
+        int type=data.at("type").get<int>();const auto &points=data.at("points");
+        if((type==3 || type==4) && !nativeTouchActive_)return;
+        if(type==2 && !nativeTouchActive_)type=1;
+        if(type==2 && it->second->bufferedAmount()>65536){++touchFailures_;return;}
+        const auto bytes=nativeTouchMessage(nextQualityRpc_++,type,points);
+        try{
+            // libdatachannel false may mean queued, not rejected. Preserve lifecycle.
+            const bool immediate=it->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size());
+            if(!immediate && type!=2)diagnostic("native-touch-queued");
+        }catch(...){++touchFailures_;return;}
+        nativeTouchActive_=type<=2;touchPoints_=points.size();++touchPackets_;
+        if(type!=2)diagnostic(type==1?"native-touch-start":type==3?"native-touch-end":"native-touch-cancel");
+        return;
+    }
     if (it->second->bufferedAmount() > 64 * 1024 &&
         (action == "mouse_move_absolute" || action == "mouse_scroll"))
         return;
+    // The UI may request a pad before SCTP opens. Retry on the worker when
+    // an actual update can be submitted; never send updates before setup.
+    if(action=="gpd_update" && !gamepadConnected_){
+        input({{"action","gpd_connect"},{"index",data.value("index",0)}});
+        if(!gamepadConnected_)return;
+    }
     auto s = data.dump();
     try {
         it->second->send(reinterpret_cast<const std::byte *>(s.data()), s.size());
     } catch (...) {
         return;
     }
+    if(action=="gpd_connect")gamepadConnected_=true;
+    else if(action=="gpd_disconnect")gamepadConnected_=false;
     if (action == "kbd_press")
         heldKeys_.insert(data.at("key").get<int>());
     else if (action == "kbd_release")
@@ -537,6 +1232,8 @@ void Client::input(const Json &data) {
         heldButtons_.erase(data.at("button").get<int>());
 }
 void Client::release() {
+    if(nativeTouchActive_)input({{"action","touch_native"},{"type",4},{"points",Json::array()}});
+    if(gamepadConnected_)input({{"action","gpd_update"},{"index",0},{"buttons",0},{"left_trigger",0},{"right_trigger",0},{"left_thumb_x",0},{"left_thumb_y",0},{"right_thumb_x",0},{"right_thumb_y",0}});
     auto keys = heldKeys_, buttons = heldButtons_;
     for (int k : keys)
         input({{"action", "kbd_release"}, {"key", k}});
@@ -547,10 +1244,19 @@ void Client::release() {
 }
 void Client::disconnect() {
     diagnostic("disconnect");
+    pendingQuality_.reset();
+    {std::lock_guard lock(stateMutex_);state_.qualityPending=false;}
+    connectedSince_=0;
+    if (strictVideo_)
+        strictVideo_->shutdown();
     release();
+    if(gamepadConnected_)input({{"action","gpd_disconnect"},{"index",0}});
+    gamepadConnected_=false;nativeTouchActive_=false;touchPoints_=0;
     ++generation_;
+    activeScreenId_=-1;
     iceState_ = rtc::PeerConnection::IceState::New;
     deadline_ = 0;
+    lastKeyframeRequest_ = 0;
     qr_ = nullptr;
     earlySoac_.clear();
     pendingCandidates_.clear();
@@ -566,7 +1272,21 @@ void Client::disconnect() {
         peer_.reset();
     }
     video_.reset();
+    rembAvailable_=false;bitrateFeedbackSent_=false;lastBitrateAttempt_=0;
+    turnBridges_.clear();
+    strictVideo_.reset();
+    videoAssembler_.reset();
     audio_.reset();
+    videoStats_.reset();
+    audioStats_.reset();
+    pendingKeyframeAt_ = 0;
+    lastKeyframeRecoveryMs_ = -1;
+    keyframeRequests_ = 0;
+    keyframeCountAtRequest_ = 0;
+    {
+        std::lock_guard lock(statsMutex_);
+        statsCache_ = {};
+    }
     socket_.reset();
     media_->reset();
     {
@@ -574,5 +1294,156 @@ void Client::disconnect() {
         state_.qrUrl.clear();
         state_.streaming = false;
     }
+}
+void Client::commitQuality(const QualityValues &q,bool hotCap,const char *notice) {
+    if(hotCap && (!video_ || !rembAvailable_ || q.cap<=0 || !video_->requestBitrate(unsigned(q.cap)*1000000u)))
+        throw std::runtime_error("码率反馈更新失败");
+    saveQuality(q.width,q.height,q.fps,q.quality,q.vsync,q.delay,q.cap,q.hevc);
+    media_->setPlayoutDelay(q.delay);
+    streamWidth_=q.width;streamHeight_=q.height;streamFps_=q.fps;streamQuality_=q.quality;
+    maxBitrateMbps_=q.cap;hevc_=q.hevc;
+    if(hotCap) {bitrateFeedbackSent_=true;diagnostic("quality-remb-hot-updated");}
+    {std::lock_guard lock(stateMutex_);
+        state_.width=q.width;state_.height=q.height;state_.fps=q.fps;state_.quality=q.quality;
+        state_.maxBitrateMbps=q.cap;state_.playoutDelayMs=q.delay;state_.vsync=q.vsync;state_.hevc=q.hevc;
+        state_.qualityPending=false;state_.qualityNotice=notice;
+    }
+    qualityNoticeUntil_=monotonicMs()+8000;
+}
+void Client::reconnectQuality(const QualityValues &q,const char *notice) {
+    const auto device=connectedDeviceId_;commitQuality(q,false,notice);disconnect();
+    setState("idle",notice);if(!device.empty())post("connect",{{"deviceId",device}});
+}
+void Client::finishQuality() {
+    if(!pendingQuality_ || !pendingQuality_->acknowledged)return;
+    const auto q=pendingQuality_->target;const auto media=media_->stats();
+    if((q.width!=streamWidth_ || q.height!=streamHeight_) && (media.width!=q.width || media.height!=q.height))return;
+    try {
+        commitQuality(q,q.cap!=maxBitrateMbps_,"电脑已应答画质设置");
+        diagnostic(pendingQuality_->headerOnly?"quality-rpc-header-only-committed":"quality-rpc-capture-committed");
+        pendingQuality_.reset();
+    }catch(...){fallbackQuality("在线设置未完成，正在重连应用…");}
+}
+void Client::fallbackQuality(const char *notice) {
+    if(!pendingQuality_)return;
+    const auto q=pendingQuality_->target;pendingQuality_.reset();++qualityFailed_;
+    diagnostic("quality-rpc-fallback-reconnect");reconnectQuality(q,notice);
+}
+void Client::tickQuality() {
+    if(pendingQuality_){
+        finishQuality();
+        if(pendingQuality_ && monotonicMs()>=pendingQuality_->deadline)fallbackQuality("在线设置超时，正在重连应用…");
+    }
+    if(qualityNoticeUntil_ && monotonicMs()>=qualityNoticeUntil_ && !pendingQuality_){
+        std::lock_guard lock(stateMutex_);state_.qualityNotice.clear();qualityNoticeUntil_=0;
+    }
+}
+void Client::applyBitrateCap() {
+    if(!video_ || !video_->isOpen() || maxBitrateMbps_<=0 || bitrateFeedbackSent_) return;
+    const auto now=monotonicMs();
+    if(lastBitrateAttempt_ && now-lastBitrateAttempt_<1000) return;
+    if(!rembAvailable_) {
+        if(!lastBitrateAttempt_) diagnostic("bitrate-cap-not-negotiated");
+        lastBitrateAttempt_=now;return;
+    }
+    lastBitrateAttempt_=now;
+    try {
+        // bps. The session repeats this stored feedback on sender reports
+        // once the primary SSRC has been bound. Never send a zero REMB.
+        bitrateFeedbackSent_=video_->requestBitrate(unsigned(maxBitrateMbps_)*1000000u);
+        diagnostic(bitrateFeedbackSent_?"bitrate-cap-feedback-configured":"bitrate-cap-feedback-unavailable");
+    } catch(...) {diagnostic("bitrate-cap-feedback-send-failed");}
+}
+void Client::refreshStats(int64_t now) {
+    applyBitrateCap();
+    lastStatsUpdate_ = now;
+    StreamStatsSnapshot stats;
+    if (peer_) {
+        if (auto rtt = peer_->rtt())
+            stats.rttMs = int(rtt->count());
+        rtc::Candidate local, remote;
+        if (peer_->getSelectedCandidatePair(&local, &remote)) {
+            const auto identity=candidateIdentity(remote);
+            const bool matchedRemoteRelay=!identity.empty() && remoteRelayEndpoints_.count(identity)>0;
+            stats.transport = selectedPath(local, remote,matchedRemoteRelay);
+            if(local.type()==rtc::Candidate::Type::Relayed && !turnBridges_.empty())
+                stats.transport+=" · TURN上行 "+turnUplinkMode_;
+            if(peer_->iceState()!=rtc::PeerConnection::IceState::Completed) stats.transport+=" · 探测中";
+            stats.localEndpoint=endpoint(local);
+            stats.remoteEndpoint=endpoint(remote);
+            const auto summary="transport="+stats.transport+"\nlocal="+stats.localEndpoint+"\nremote="+stats.remoteEndpoint+"\n";
+            if (summary!=lastSelectedPath_) {
+                recordSelectedPath(summary);lastSelectedPath_=summary;
+                if(diagEnabled()) {
+                    auto &history=iceDiagnostics_["path_history"];
+                    if(history.size()>=128) history.erase(history.begin());
+                    history.push_back({{"time_ms",nowMs()},{"monotonic_ms",now},{"transport",stats.transport},{"local",stats.localEndpoint},
+                        {"remote",stats.remoteEndpoint},{"matched_signaled_relay",matchedRemoteRelay},
+                        {"ice_state",int(peer_->iceState())},{"rtt_ms",stats.rttMs}});
+                    saveIceDiagnostics();
+                }
+                recordIceCandidate("local","selected",local);recordIceCandidate("remote","selected",remote);
+            }
+        }
+    }
+    if (videoStats_)
+        stats.video = videoStats_->snapshot();
+    if (audioStats_)
+        stats.audio = audioStats_->snapshot();
+    const auto media = media_->stats();
+    stats.sampledMs=now;stats.decodedTotal=media.decodedTotal;stats.publishedTotal=media.publishedTotal;
+    stats.mediaEpoch=media.epoch;stats.inputQueued=media.inputQueued;stats.hardwareFrame=media.hardwareFrame;
+    stats.skipDue=media.skipDue;stats.skipBound=media.skipBound;stats.selectedLateMs=media.selectedLateMs;
+    stats.cpuTransfers=media.cpuTransfers;stats.nativePublished=media.nativePublished;
+    stats.codec = media.codec;
+    stats.encoder = media.encoder;
+    stats.decoder = media.decoder;
+    stats.width = media.width;
+    stats.height = media.height;
+    stats.decodeFps = media.fps;
+    stats.requestedFps = streamFps_;
+    stats.maxBitrateMbps=maxBitrateMbps_;stats.bitrateFeedbackSent=bitrateFeedbackSent_;
+    stats.touchPackets=touchPackets_;stats.touchFailures=touchFailures_;stats.touchPoints=touchPoints_;
+    stats.qualitySent=qualitySent_;stats.qualityAcked=qualityAcked_;stats.qualityFailed=qualityFailed_;
+    stats.qualityPending=bool(pendingQuality_);
+    stats.activeScreenId=activeScreenId_;stats.qualityCode=lastQualityCode_;stats.qualityErrors=lastQualityErrors_;
+    stats.decodeMs = media.decodeMs;
+    stats.pacing = media.pacing;
+    stats.playoutDelayMs = media.playoutDelayMs;
+    stats.readyFrames = media.readyFrames;
+    stats.presentationSkipped = media.presentationSkipped;
+    stats.clockResets = media.clockResets;
+    stats.missingTimestamps = media.missingTimestamps;
+    stats.decodeErrors = media.decodeErrors;
+    stats.droppedFrames = media.droppedFrames;
+    stats.keyframeRequests = keyframeRequests_;
+    stats.keyframeRecoveryMs = lastKeyframeRecoveryMs_;
+    if (videoAssembler_) {
+        stats.nackSent = videoAssembler_->nackCount();
+        stats.rtxRecovered = videoAssembler_->rtxCount();
+    }
+    if (strictVideo_) {
+        strictVideo_->setRtt(stats.rttMs);
+        const auto receiver = strictVideo_->snapshot();
+        stats.strictReceiver = true;
+        stats.nackSent = receiver.nackMessages;
+        stats.rtxRecovered = receiver.rtxRecovered;
+        stats.receiverAccepted = receiver.accepted;
+        stats.receiverDropped = receiver.dropped;
+        stats.receiverWaitingIdr = receiver.waitingIdr;
+        stats.receiverFastForwards = receiver.fastForwards;
+        stats.receiverMeanWaitMs = receiver.meanWaitMs;
+        stats.receiverRecentWaitMs = receiver.recentWaitMs;
+        stats.receiverMaxWaitMs = receiver.maxWaitMs;
+        stats.receiverPending=receiver.pendingFrames;stats.receiverBlockedMs=receiver.blockedMs;
+        stats.nackRetryMs=receiver.nackRetryMs;stats.repairRttMs=receiver.repairRttMs;
+        stats.nackRepeated=receiver.repeatedRequests;stats.receiverPli=receiver.pliRequests;
+    }
+    std::lock_guard lock(statsMutex_);
+    statsCache_ = std::move(stats);
+}
+StreamStatsSnapshot Client::streamStats() {
+    std::lock_guard lock(statsMutex_);
+    return statsCache_;
 }
 } // namespace uu

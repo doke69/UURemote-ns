@@ -1,6 +1,9 @@
 #include "transport.hpp"
 #include "auth.hpp"
 #include <chrono>
+#include <fstream>
+#include <cstdio>
+#include <sys/stat.h>
 #include <mbedtls/sha1.h>
 #include <stdexcept>
 #include <thread>
@@ -86,13 +89,10 @@ Json Api::request(const std::string &method, const std::string &path, const Json
     curl_easy_getinfo(c.handle, CURLINFO_RESPONSE_CODE, &status);
     if (status == 204 || status == 205)
         return nullptr;
+    if(status==401){logout();throw std::runtime_error("登录已失效，请重新登录");}
     auto json = Json::parse(response, nullptr, false);
     if (json.is_discarded() || !json.is_object())
         throw std::runtime_error("UU returned an invalid response (HTTP " + std::to_string(status) + ")");
-    if (status == 401) {
-        logout();
-        throw std::runtime_error("登录已失效，请重新登录");
-    }
     if (status < 200 || status >= 300 || json.value("code", -1) != 0)
         throw std::runtime_error(json.value("msg", std::string("UU request failed")));
     return json.value("data", Json{});
@@ -129,6 +129,47 @@ void Api::login(const Json &result) {
     auto account = loginAccount(result);
     token_ = std::move(account.token);
     user_ = std::move(account.userId);
+    nickname_=std::move(account.nickname);
+    sessionSaved_=saveSession();
+}
+namespace {
+constexpr const char *sessionPath=
+#ifdef __SWITCH__
+    "sdmc:/switch/UURemote-ns/session.json";
+#else
+    "session.json";
+#endif
+}
+bool Api::saveSession(){
+    if(token_.empty() || user_.empty() || device_.empty())return false;
+    const auto temp=std::string(sessionPath)+".tmp";
+    try{
+        const auto bytes=Json{{"version",1},{"client",client_},{"device",device_},{"token",token_},{"user",user_},{"nickname",nickname_}}.dump();
+        std::ofstream file(temp,std::ios::binary|std::ios::trunc);file.write(bytes.data(),bytes.size());file.flush();
+        const bool good=bool(file);file.close();
+        if(!good || file.fail()){std::remove(temp.c_str());return false;}
+        chmod(temp.c_str(),0600);
+        // Same-directory rename keeps a previous valid cache on failed replacement.
+        if(std::rename(temp.c_str(),sessionPath)!=0){std::remove(temp.c_str());return false;}
+        return true;
+    }catch(...){std::remove(temp.c_str());return false;}
+}
+bool Api::restoreSession(){
+    try{
+        std::ifstream file(sessionPath,std::ios::binary);if(!file)return false;
+        char buffer[16385];file.read(buffer,sizeof buffer);const auto size=file.gcount();
+        if(size<=0 || size>16384)return false;
+        const auto saved=Json::parse(buffer,buffer+size,nullptr,false);
+        if(!saved.is_object() || saved.value("version",0)!=1 || saved.value("client",std::string{})!=client_)return false;
+        auto bounded=[&](const char *key,size_t limit){auto it=saved.find(key);return it!=saved.end() && it->is_string() && !it->get_ref<const std::string&>().empty() && it->get_ref<const std::string&>().size()<=limit;};
+        if(!bounded("token",8192)||!bounded("user",256)||!bounded("device",256)||!bounded("nickname",512))return false;
+        token_=saved["token"].get<std::string>();user_=saved["user"].get<std::string>();device_=saved["device"].get<std::string>();nickname_=saved["nickname"].get<std::string>();
+        sessionSaved_=true;return true;
+    }catch(...){return false;}
+}
+void Api::logout(){
+    token_.clear();user_.clear();nickname_.clear();sessionSaved_=false;
+    std::remove(sessionPath);std::remove((std::string(sessionPath)+".tmp").c_str());
 }
 SignalSocket::~SignalSocket() {
     close();
