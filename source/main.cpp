@@ -573,7 +573,7 @@ int main(int, char **) {
                 int selected = 0, texW = 0, texH = 0;
                 uint64_t serial = 0, lastHeld = 0;
                 unsigned lastArrowMask=0;
-                bool nativePadConnected=false,plusPending=false,startPulse=false,minusPending=false,selectPulse=false;
+                bool nativePadRequested=false,plusPending=false,startPulse=false,minusPending=false,selectPulse=false;
                 Uint32 nativePadSentAt=0,plusAt=0,minusAt=0;std::string lastNativePad;
                 auto padPacket=[&](uint32_t buttons,int lx,int ly,int rx,int ry,int lt,int rt){
                     return uu::Json{{"action","gpd_update"},{"index",0},{"buttons",buttons},{"left_trigger",lt},{"right_trigger",rt},
@@ -732,7 +732,7 @@ int main(int, char **) {
                         }
                         if(liveUi.gamepadMode()) {
 #ifdef __SWITCH__
-                            if(!nativePadConnected){send({{"action","gpd_connect"},{"index",0}});nativePadConnected=true;lastNativePad.clear();}
+                            if(!nativePadRequested){send({{"action","gpd_connect"},{"index",0}});nativePadRequested=true;lastNativePad.clear();}
                             uint32_t mask=0;
                             const auto physical=captureMenuInput?uint64_t(0):c.held;
                             for(auto [button,bit]:std::initializer_list<std::pair<uint64_t,uint32_t>>{
@@ -749,7 +749,7 @@ int main(int, char **) {
                             startPulse=false;
 #endif
                             c.held=0;c.mx=c.my=c.scroll=0;
-                        }else if(nativePadConnected){send(padPacket(0,0,0,0,0,0,0));send({{"action","gpd_disconnect"},{"index",0}});nativePadConnected=false;}
+                        }else if(nativePadRequested){send(padPacket(0,0,0,0,0,0,0));send({{"action","gpd_disconnect"},{"index",0}});nativePadRequested=false;}
                         cursorX = std::clamp(cursorX + c.mx * dt * liveUi.pointerSpeed(), 0.f, 1.f);
                         cursorY = std::clamp(cursorY + c.my * dt * liveUi.pointerSpeed(), 0.f, 1.f);
                         if ((c.mx || c.my) && now - lastPointer >= 16) {
@@ -812,7 +812,7 @@ int main(int, char **) {
                         }
 #endif
                     } else {
-                        nativePadConnected=false;lastNativePad.clear();plusPending=startPulse=false;
+                        nativePadRequested=false;lastNativePad.clear();plusPending=startPulse=false;
                         if (wasStreaming) {
                             streamTouch.cancel(send);streamTouch.resetZoom();nativeTouch.cancel(send);minusPending=false;
                             uu::display::resetVideo();

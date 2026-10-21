@@ -10,7 +10,7 @@ class LiveFrontend {
     bool nativeMultitouch=true;Uint32 modeNoticeUntil=0;
     bool resetTouchZoom=false,touchDown=false,wasStreaming=false,wasAuthenticated=false,draining=false;
     Uint32 settingsSentAt=0,connectedAt=0;int requestedCap=0;
-    std::string device,keyboardText,pendingShortcut,notice;
+    std::string device,keyboardText,pendingShortcut,notice,saveError;
     const char *qualityNames[5]={"自动","省流","清晰","高清","原画"};
     static constexpr const char *prefsPath=
 #ifdef __SWITCH__
@@ -19,8 +19,49 @@ class LiveFrontend {
         "ui-state.json";
 #endif
     static std::string number(double value){if(value<0)return "--";char out[32];std::snprintf(out,sizeof out,"%.1f",value);return out;}
-    void save(){
-        std::ofstream(prefsPath)<<uu::Json{{"network_overlay",networkOverlay},{"sound",sound},{"volume",volume},{"mouse_speed",mouseSpeed},{"touch_mode",touchMode},{"scheme",scheme},{"xbox_layout",xboxLayout},{"multitouch",nativeMultitouch}}.dump(2);
+    static bool readPrefs(const std::string &path,uu::Json &p){
+        try{
+            std::ifstream file(path,std::ios::binary);if(!file)return false;
+            std::string data((std::istreambuf_iterator<char>(file)),{});
+            if(file.bad() || data.size()>4096)return false;
+            auto value=uu::Json::parse(data);if(!value.is_object())return false;
+            for(const char *key:{"network_overlay","sound","multitouch"})
+                if(value.contains(key)&&!value[key].is_boolean())return false;
+            for(const char *key:{"volume","mouse_speed","touch_mode","scheme","xbox_layout"})
+                if(value.contains(key)&&!value[key].is_number_integer())return false;
+            p=std::move(value);return true;
+        }catch(...){return false;}
+    }
+    static bool commitPrefs(){
+#ifdef __SWITCH__
+        return R_SUCCEEDED(fsdevCommitDevice("sdmc"));
+#else
+        return true;
+#endif
+    }
+    bool save(){
+        const std::string path=prefsPath,tmp=path+".tmp",backup=path+".previous";
+        auto fail=[&](){saveError="设置保存失败；本次仍生效，重启后可能恢复旧设置";return false;};
+        try{
+            const auto data=uu::Json{{"network_overlay",networkOverlay},{"sound",sound},{"volume",volume},{"mouse_speed",mouseSpeed},{"touch_mode",touchMode},{"scheme",scheme},{"xbox_layout",xboxLayout},{"multitouch",nativeMultitouch}}.dump(2);
+            FILE *file=std::fopen(tmp.c_str(),"wb");if(!file)return fail();
+            bool ok=std::fwrite(data.data(),1,data.size(),file)==data.size();
+            ok=std::fflush(file)==0&&ok;ok=std::fclose(file)==0&&ok;
+            if(!ok || !commitPrefs())return fail();
+            struct stat st{};const bool hadOriginal=stat(path.c_str(),&st)==0;
+            if(hadOriginal){
+                uu::Json previous;if(!readPrefs(path,previous))return fail();
+                if(stat(backup.c_str(),&st)==0 && std::remove(backup.c_str())!=0)return fail();
+                if(std::rename(path.c_str(),backup.c_str())!=0)return fail();
+            }
+            if(std::rename(tmp.c_str(),path.c_str())!=0){
+                if(hadOriginal)std::rename(backup.c_str(),path.c_str());
+                commitPrefs();return fail();
+            }
+            if(!commitPrefs())return fail(); // Preserve recovery copy on uncertain commit.
+            std::remove(backup.c_str()); // A cleanup failure does not invalidate committed data.
+            saveError.clear();return true;
+        }catch(...){return fail();}
     }
     void push(Page p){touchTarget=-1;touchDown=false;hit=-1;stack.push_back({p,0});notice.clear();}
     void back(){touchTarget=-1;touchDown=false;hit=-1;if(stack.size()>1)stack.pop_back();else if(wasStreaming){stack.clear();draining=true;}}
@@ -98,9 +139,11 @@ class LiveFrontend {
 public:
     bool networkOverlay=false;
     explicit LiveFrontend(uu::Client &c,std::shared_ptr<uu::Media> m,SDL_Renderer *r):client(c),media(std::move(m)),renderer(r){
-        try{std::ifstream file(prefsPath);if(file){std::string data((std::istreambuf_iterator<char>(file)),{});if(data.size()<=4096){auto p=uu::Json::parse(data);
+        uu::Json p;
+        if(readPrefs(prefsPath,p) || readPrefs(std::string(prefsPath)+".previous",p)){
             networkOverlay=p.value("network_overlay",false);sound=p.value("sound",true);volume=std::clamp(p.value("volume",100),0,100);
-            mouseSpeed=std::clamp(p.value("mouse_speed",1),0,3);touchMode=std::clamp(p.value("touch_mode",0),0,1);scheme=std::clamp(p.value("scheme",2),1,2);xboxLayout=std::clamp(p.value("xbox_layout",0),0,1);nativeMultitouch=p.value("multitouch",true);}}}catch(...){}
+            mouseSpeed=std::clamp(p.value("mouse_speed",1),0,3);touchMode=std::clamp(p.value("touch_mode",0),0,1);scheme=std::clamp(p.value("scheme",2),1,2);xboxLayout=std::clamp(p.value("xbox_layout",0),0,1);nativeMultitouch=p.value("multitouch",true);
+        }
         media->setVolume(sound?volume:0);
     }
     bool active()const{return !stack.empty();}
@@ -425,7 +468,8 @@ public:
             }
         }
 
-        if(notice.empty())aligned(r,f.small,snapshot.qualityNotice.empty()?snapshot.detail:snapshot.qualityNotice,{65,638,710,32},label);
+        if(!saveError.empty())aligned(r,f.small,saveError,{65,638,710,32},SDL_Color{255,170,140,255});
+        else if(notice.empty())aligned(r,f.small,snapshot.qualityNotice.empty()?snapshot.detail:snapshot.qualityNotice,{65,638,710,32},label);
         else aligned(r,f.small,notice,{65,638,710,32},SDL_Color{149,191,255,255});
         rect(r,0,672,1280,48,SDL_Color{23,24,27,255});aligned(r,f.small,"A 确定   B 返回   方向键选择   也可直接点选",{65,678,900,36},label);
 

@@ -76,18 +76,22 @@ for target, name, note in (
         ('switch', f'UURemote-ns-{version}-switch.zip', '安装说明-Switch.txt'),
         ('switch-lite', f'UURemote-ns-{version}-switch-lite.zip', '安装说明-SwitchLite.txt')):
     archive = ROOT/'dist'/name
-    with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
         paths = [destination, ROOT/'dist/README.md', ROOT/'dist/THIRD_PARTY.md',
                  ROOT/'dist/LICENSE', ROOT/'dist/SHA256SUMS']
         paths += list((ROOT/'dist/docs').rglob('*')) + list(notice_dir.glob('*'))
         paths.append(ROOT/'dist'/note)
-        for path in paths:
+        for path in sorted(set(paths), key=lambda p: p.relative_to(ROOT/'dist').as_posix()):
             if not path.is_file():
                 continue
-            z.write(path, path.relative_to(ROOT/'dist'))
+            info = zipfile.ZipInfo(path.relative_to(ROOT/'dist').as_posix(), (1980,1,1,0,0,0))
+            info.create_system = 3
+            info.external_attr = 0o100644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(info, path.read_bytes(), compresslevel=9)
     archives.append(archive)
     print(archive)
-(ROOT/'dist/SHA256SUMS').write_text(
-    f'{digest}  UURemote-ns.nro\n' +
+(ROOT/'dist/ARCHIVE-SHA256SUMS').write_text(
+    f'{digest}  switch/UURemote-ns/UURemote-ns.nro\n' +
     ''.join(f'{hashlib.sha256(a.read_bytes()).hexdigest()}  {a.name}\n' for a in archives))
 print('NRO SHA256:', digest)

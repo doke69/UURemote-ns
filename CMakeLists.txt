@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 project(UURemote-ns VERSION 0.1.52 LANGUAGES C CXX)
+set(UU_BUILD_LABEL "${PROJECT_VERSION}" CACHE STRING "Version label for a local review candidate")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
@@ -107,7 +108,7 @@ endif()
 add_library(qrcodegen external/qrcodegen/cpp/qrcodegen.cpp)
 target_include_directories(qrcodegen PUBLIC external/qrcodegen/cpp)
 add_executable(UURemote-ns source/main.cpp source/client.cpp source/media.cpp source/stream_stats.cpp source/video_assembler.cpp source/strict_video_receiver.cpp source/transport.cpp source/turn_stream.cpp source/live_telemetry.cpp source/native_display.cpp)
-target_compile_definitions(UURemote-ns PRIVATE UU_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(UURemote-ns PRIVATE UU_VERSION="${UU_BUILD_LABEL}")
 target_link_libraries(UURemote-ns PRIVATE uu_protocol uu_runtime datachannel-static qrcodegen)
 target_compile_options(UURemote-ns PRIVATE -Wall -Wextra)
 if(UU_SWITCH)
@@ -129,13 +130,27 @@ if(UU_SWITCH)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/romfs/signing.key")
         message(FATAL_ERROR "Provide signing material locally; never commit it. See docs/build-v52.md")
     endif()
+    find_program(UU_UAM NAMES uam uam.exe HINTS "${DEVKITPRO}/tools/bin" DOC "Existing devkitPro shader compiler")
+    if(NOT UU_UAM)
+        message(FATAL_ERROR "uam is required to build shaders. Set UU_UAM to an existing executable.")
+    endif()
+    set(UU_SHADER_OUTPUTS)
+    foreach(shader nv12.vert nv12.frag ui.vert ui.frag)
+        get_filename_component(stage "${shader}" LAST_EXT)
+        string(SUBSTRING "${stage}" 1 -1 stage)
+        set(output "${CMAKE_SOURCE_DIR}/romfs/shaders/${shader}.dksh")
+        add_custom_command(OUTPUT "${output}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_SOURCE_DIR}/romfs/shaders"
+            COMMAND "${UU_UAM}" -s "${stage}" -o "${output}" "${CMAKE_SOURCE_DIR}/shaders/${shader}"
+            DEPENDS "${CMAKE_SOURCE_DIR}/shaders/${shader}" "${UU_UAM}" VERBATIM)
+        list(APPEND UU_SHADER_OUTPUTS "${output}")
+    endforeach()
     file(GLOB UU_TV_ASSETS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/romfs/ui-tv/*.rgba")
     add_custom_command(OUTPUT "${CMAKE_BINARY_DIR}/UURemote-ns.nro"
-        COMMAND "${DEVKITPRO}/tools/bin/nacptool" --create "UU远程" "UURemote contributors" "${PROJECT_VERSION}" "${CMAKE_BINARY_DIR}/UURemote-ns.nacp"
+        COMMAND "${DEVKITPRO}/tools/bin/nacptool" --create "UU远程" "UURemote contributors" "${UU_BUILD_LABEL}" "${CMAKE_BINARY_DIR}/UURemote-ns.nacp"
         COMMAND "${DEVKITPRO}/tools/bin/elf2nro" "$<TARGET_FILE:UURemote-ns>" "${CMAKE_BINARY_DIR}/UURemote-ns.nro" "--nacp=${CMAKE_BINARY_DIR}/UURemote-ns.nacp" "--icon=${CMAKE_SOURCE_DIR}/assets/uu-remote-icon.jpg" "--romfsdir=${CMAKE_SOURCE_DIR}/romfs"
         DEPENDS UURemote-ns ${UU_TV_ASSETS} "${CMAKE_SOURCE_DIR}/assets/uu-remote-icon.jpg" "${CMAKE_SOURCE_DIR}/romfs/signing.key"
-        "${CMAKE_SOURCE_DIR}/romfs/shaders/nv12.vert.dksh" "${CMAKE_SOURCE_DIR}/romfs/shaders/nv12.frag.dksh"
-        "${CMAKE_SOURCE_DIR}/romfs/shaders/ui.vert.dksh" "${CMAKE_SOURCE_DIR}/romfs/shaders/ui.frag.dksh" VERBATIM)
+        ${UU_SHADER_OUTPUTS} VERBATIM)
     add_custom_target(nro ALL DEPENDS "${CMAKE_BINARY_DIR}/UURemote-ns.nro")
 else()
     find_package(PkgConfig REQUIRED)

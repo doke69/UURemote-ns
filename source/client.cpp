@@ -1187,6 +1187,7 @@ void Client::input(const Json &data) {
     const auto action = data.value("action", std::string{});
     if (it == channels_.end() || !it->second->isOpen()){
         if(action=="touch_native")++touchFailures_;
+        gamepadConnected_=false;
         return;
     }
     if(action=="touch_native"){
@@ -1207,6 +1208,12 @@ void Client::input(const Json &data) {
     if (it->second->bufferedAmount() > 64 * 1024 &&
         (action == "mouse_move_absolute" || action == "mouse_scroll"))
         return;
+    // The UI may request a pad before SCTP opens. Retry on the worker when
+    // an actual update can be submitted; never send updates before setup.
+    if(action=="gpd_update" && !gamepadConnected_){
+        input({{"action","gpd_connect"},{"index",data.value("index",0)}});
+        if(!gamepadConnected_)return;
+    }
     auto s = data.dump();
     try {
         it->second->send(reinterpret_cast<const std::byte *>(s.data()), s.size());
