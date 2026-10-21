@@ -49,13 +49,23 @@ class LiveFrontend {
             ok=std::fflush(file)==0&&ok;ok=std::fclose(file)==0&&ok;
             if(!ok || !commitPrefs())return fail();
             struct stat st{};const bool hadOriginal=stat(path.c_str(),&st)==0;
+            bool movedValidOriginal=false;
             if(hadOriginal){
-                uu::Json previous;if(!readPrefs(path,previous))return fail();
-                if(stat(backup.c_str(),&st)==0 && std::remove(backup.c_str())!=0)return fail();
-                if(std::rename(path.c_str(),backup.c_str())!=0)return fail();
+                uu::Json previous;
+                if(readPrefs(path,previous)){
+                    if(stat(backup.c_str(),&st)==0 && std::remove(backup.c_str())!=0)return fail();
+                    if(std::rename(path.c_str(),backup.c_str())!=0)return fail();
+                    movedValidOriginal=true;
+                }else{
+                    // Keep a valid recovery copy while quarantining the corrupt primary.
+                    std::string invalid;unsigned suffix=0;
+                    do{invalid=path+".invalid-"+std::to_string(suffix++);}
+                    while(stat(invalid.c_str(),&st)==0 && suffix<1024);
+                    if(stat(invalid.c_str(),&st)==0 || std::rename(path.c_str(),invalid.c_str())!=0)return fail();
+                }
             }
             if(std::rename(tmp.c_str(),path.c_str())!=0){
-                if(hadOriginal)std::rename(backup.c_str(),path.c_str());
+                if(movedValidOriginal)std::rename(backup.c_str(),path.c_str());
                 commitPrefs();return fail();
             }
             if(!commitPrefs())return fail(); // Preserve recovery copy on uncertain commit.
