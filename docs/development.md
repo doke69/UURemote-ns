@@ -103,34 +103,6 @@ Switch 最终链接通过 `--wrap=sslConnectionRead` / `--wrap=sslConnectionWrit
 
 测试覆盖持续来包、单次读取耗尽时间预算、取消时不再读取；TLS 模拟服务验证读写在非阻塞模式下执行，WouldBlock、部分读写和设置模式失败均完整保留。交叉编译使用真实 libnx 头；最终 ELF 的 libnx_recv / libnx_send 分别调用包装函数，包装函数调用真实 SSL 服务入口。真机是否能完成 DTLS / SCTP 仍需更新后验证。
 
-## v0.1.7：事件恢复与 I/O 期限
-
-代码检查发现，客户端原先把整批事件移到局部队列后处理；任一处理器抛错时，剩余事件随栈展开一起销毁，可能丢失已经排队的退出账号或取消命令。现在按批次初始数量逐条取出，处理器在锁外运行；异常时保留剩余事件，处理器新加入的事件留到下一批，连接代次过滤保持有效。新增回归覆盖处理失败、处理器追加事件和中途停止。
-
-信令发送与 WebSocket 升级握手原来只在 `CURLE_AGAIN` 时检查超时。持续成功返回少量字节可能绕过期限；现在每次重试前统一检查单调时钟期限，即使仍有少量进展，也受原定 5 秒 / 15 秒限制。
-
-本机 7 项测试及 Switch 交叉编译通过。模拟器已安装到项目工具目录，但当前仍缺少 `prod.keys` 和固件，停在 RYU-0001 提示；尚未完成 NRO 启动和正式 UU 连接测试。这些改动不能视为已经解决真机协商故障。
-
-## v0.1.7：媒体生命周期与完整 Windows 调试
-
-媒体构造函数打开 SDL 音频设备后，如果 Opus 初始化或线程创建失败，旧实现没有回收已创建的资源。现在在构造函数体内捕获失败并清理。视频线程增加异常边界，FFmpeg 上下文、帧、包及缩放器统一用作用域对象释放，避免像素分配或缩放异常直接终止进程；失败后停止接受新视频包，并提示重新启动程序。
-
-`Media::reset` 现在持有视频队列锁后才推进连接代次，并在同一临界区清空旧帧。旧顺序在加锁前推进代次，可能让解码线程把仍在队列中的旧帧标记为新连接帧。连接超时、心跳、二维码期限和短信冷却统一使用 `monotonicMs`；API 签名和连接协议中的 Unix 时间戳继续使用 `nowMs`。
-
-新增 `UU_NATIVE_TESTS` 和 `scripts/build-native.ps1`，以真实 FFmpeg / SDL / Opus 运行 16×16 合成红色视频，验证 RGBA 输出、重置后的旧代次丢弃、新帧恢复，并在 GNU 构建中注入帧分配失败、缩放器异常和 Opus 初始化失败，检查资源释放及后续音频设备可重新打开。本机 7 项核心测试、真实媒体集成测试和 Switch ARM64 构建通过。
-
-完整 Windows 客户端的首次运行暴露了两项环境问题：GCC 15 产物与 GCC 16 运行库的 TLS 符号不匹配；便携 curl 指向未生成的 CA 文件。原生 SDK 现锁定同一套编译器及依赖，下载 SHA256 记录在 `scripts/sdk-native-windows.lock.json`；Windows 请求使用原生证书库，保留证书链与主机名验证，参考 [curl 的原生 CA 选项](https://curl.se/libcurl/c/CURLOPT_SSL_OPTIONS.html)。
-
-2026-10-19，用户扫码确认后，本机完整客户端实际完成设备同步、ICE / DTLS / SCTP 协商，并显示原版电脑端的远程锁屏画面；随后两轮断开重连均成功。共三次真实连接，只有首次通过截图确认画面，不将此扩展为每轮音视频和输入均已验证。没有将用户二维码、桌面截图、账号凭据或原始日志纳入仓库。
-
-尚待验证：Switch 真机网络与 NVDEC、实际音频播放、完整输入语义和长期稳定性。本机短信键盘仍是空实现；模拟器仍缺少密钥与固件。Windows 调试环境用于缩短协议排查周期，Switch 运行时继续独立连接 UU。
-
-## v0.1.7：音频错误可见性
-
-SDL 音频设备打开失败时仍允许视频串流，但状态栏现在明确提示音频设备不可用。音频入队失败时显示播放错误，下一包成功入队后清除该提示。视频线程停止的错误优先于 NVDEC 软件回退提示，避免回退提示掩盖后续致命错误。
-
-媒体回归测试验证真实 Opus 解码产生的 20 ms 双声道 PCM 已送入 SDL、旧连接音频被丢弃，以及设备打开失败不影响视频输出、入队失败可见且成功后恢复。测试使用 SDL dummy 音频驱动，不能证明扬声器实际发声。
-
 ## 参考
 
 - 参考项目 `UURemote-web` 中的 `server/uu-api.mjs`、`public/lib/streamer.js`、`public/lib/protocol.js`、`public/lib/protobuf.js`。
@@ -138,3 +110,41 @@ SDL 音频设备打开失败时仍允许视频串流，但状态栏现在明确�
 - [Switch SDL2 示例](https://github.com/switchbrew/switch-examples/tree/master/graphics/sdl2/sdl2-simple)：原生应用和依赖链接。
 - [devkitPro FFmpeg 包构建](https://github.com/devkitPro/pacman-packages/blob/master/switch/ffmpeg/PKGBUILD)：Horizon/NVTEGRA 支持。
 - [NVTEGRA FFmpeg 实现说明](https://ffmpeg.org/pipermail/ffmpeg-devel/2024-May/328549.html)。
+
+## v0.1.7 系统 23.0.1 / 大气层 1.12.1 适配
+
+- 目标环境、机型差异、安装与真机自检见 [固件 23.0.1 / AMS 1.12.1 适配说明](firmware-23.0.1-ams-1.12.1.md)。
+- `source/main.cpp` 新增 `set:sys` 初始化与 `setsysGetProductModel()` / `setsysGetFirmwareVersion()`，首页底部显示机型 · 模式 · 系统版本，
+  并把 `console-<机型>-<模式>-fw<x.y.z>` 写入 `connection.log`；窗口创建改为 TV 1920×1080 / 掌机 1280×720，并加 `SDL_WINDOW_RESIZABLE`
+  让 devkitPro SDL2 驱动在插拔底座时自动切换，渲染逻辑尺寸仍为 1280×720。
+- 固件 23.0.x 本身不需要改协议实现：libnx 4.12.0 已包含 23.0.0 的 svc/spl 类型与 21.0.0 之后的 TLS ABI 标记；AMS 1.12.1 修复了
+  dns.mitm 的 c-ares 拦截与 fs.mitm 的 BatchRead 支持，hbmenu 3.6.1 / hbl 2.4.5 为其自带版本。
+- 构建锁定 SDK 补入了原 `sdk-windows.lock.json` 遗漏的 portlibs：`switch-libopus`、`switch-bzip2`、`switch-libdrm_nouveau`、
+  `switch-libfribidi`（否则链接 `-lopus` / `-lbz2` / `-ldrm_nouveau` 失败）。
+- Windows 上 devkitA64 binutils 无法打开含非 ASCII 字符的绝对路径，构建需通过纯 ASCII 目录联接（如 `mklink /J C:\uu\repo ...`）
+  并把 `TEMP`/`TMP` 指向 ASCII 目录；详见 README「源码构建」注意事项。
+
+## v0.1.8 花屏修复
+
+真机反馈：电脑端画面正常，Switch 端花屏（彩色块 / 条带 / 局部错乱）。判断为 RTP/UDP 丢包或解码队列丢帧后
+H.264 参考帧丢失，而客户端从不请求关键帧，导致画面长期停留在错误隐藏结果上。
+
+- `source/client.cpp`：`video_->requestKeyframe()` 发送 RTCP PLI。连接建立（peer-state Connected）后立即请求一次；
+  主循环中在解码器请求（`media_->takeKeyframeRequest()`）、画面停滞 >1.5 s 或距上次请求 >4 s 时再次请求，最小间隔 700 ms。
+  事件写入日志：`rtc-keyframe-initial` / `-media` / `-stall` / `-periodic`。
+- `source/media.cpp`：检查 `AVFrame.decode_error_flags`；损坏帧不再覆盖最后一帧好画面（连续 2 s 无干净帧才恢复显示）；
+  解码队列上限 8→16，溢出时清空积压、刷新解码器并请求 IDR；NVDEC 解码线程数改为 1（软件解码 3）；
+  新增 `config.ini` 的 `decoder=auto|software|hardware` 与状态行（解码方式 / 分辨率 / 解码错误 / 丢帧）。
+- 若仍花屏：覆盖层状态行可区分「软件解码 / NVDEC 硬件解码」，`decoder=software` 可排除 NVDEC 驱动因素；
+  同时需要确认发送端是否响应 PLI（日志中会持续出现 `rtc-keyframe-*` 事件）。
+
+## v0.1.9 网络信息面板
+
+- `source/stream_stats.cpp`：`uu::RtpTrackStats`（`rtc::MediaHandler`）插入视频/音频 track 的 handler 链尾，
+  接收原始 RTP 包，按 16 位序列号差值统计丢包、按 RFC 3550 计算抖动、按 1 秒窗口计算码率。
+- `source/media.cpp`：解析 Annex-B 的 SPS（档次/级别）、SEI user_data_unregistered（对端编码器标识）与 IDR；
+  统计解码帧率、单帧解码耗时（EMA）、解码错误/丢帧；`Media::stats()` 暴露 `MediaStats`。
+- `source/client.cpp`：worker 每 0.5 秒汇总 `PeerConnection::rtt()`（SCTP srtt，与媒体同一 UDP 路径）、
+  `getSelectedCandidatePair()`（局域网/P2P/TURN、UDP/TCP）、音视频 RTP 统计与解码统计；
+  记录 PLI 请求次数与「请求→IDR」恢复耗时；快照加锁缓存供 UI 线程读取，避免跨线程访问 RTC 对象。
+- `source/main.cpp`：R3（`HidNpadButton_StickR`）/ F3 切换半透明信息面板；覆盖层提示加入「R3 网络信息」。

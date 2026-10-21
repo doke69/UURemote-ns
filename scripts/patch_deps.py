@@ -120,3 +120,17 @@ replace(Path('deps/libjuice/src/conn_poll.c'), '#ifdef _WIN32', '#if defined(_WI
 replace(Path('deps/libjuice/src/conn_poll.c'), '#ifndef _WIN32', '#if !defined(_WIN32) && !defined(__SWITCH__)')
 replace(Path('deps/libjuice/src/conn_poll.c'), '#include <string.h>', '#include <string.h>\n#ifdef __SWITCH__\n#define WSAENOTSOCK ENOTSOCK\n#endif')
 print('Horizon patches applied.')
+
+# Reviewed v52 networking overlays, applied after the original compatibility edits.
+# These are source files under MPL-2.0; retain the upstream notices.
+import hashlib
+import shutil
+import json
+import sys
+_overlays = Path(__file__).resolve().parent / 'dependency-overrides'
+_manifest = json.loads((_overlays / 'manifest.json').read_text())
+for _entry in _manifest:
+    _source = _overlays / _entry['path']
+    if hashlib.sha256(_source.read_bytes()).hexdigest() != _entry['sha256']:
+        raise RuntimeError('Dependency overlay hash mismatch: ' + _entry['path'])
+    shutil.copyfile(_source, root / _entry['path'])

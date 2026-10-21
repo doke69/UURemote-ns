@@ -1,4 +1,5 @@
 .tools/
+.artifacts/
 external/
 build*/
 dist/
@@ -10,3 +11,17 @@ romfs/signing.key
 __pycache__/
 client-id
 connection.log
+
+# Per-user credentials, pairing and diagnostics are never source artifacts.
+*.key
+*.keys
+session.json*
+telemetry.ini
+ui-state.json
+config.ini
+diag/
+*.log
+*.nsp
+*.xci
+*.apk
+*.dksh

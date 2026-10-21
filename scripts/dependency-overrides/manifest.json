@@ -1,0 +1,18 @@
+[
+  {
+    "path": "deps/libjuice/src/agent.c",
+    "sha256": "a2ebab6591bdec8b2f936927ffa11eec44a898a51dfea780a464e8c674b61742"
+  },
+  {
+    "path": "deps/libjuice/src/agent.h",
+    "sha256": "66387f649b79a3ea257685ac1a0e37a2bdb9288e4845b06e1e68e33e7475a3c7"
+  },
+  {
+    "path": "deps/libjuice/src/ice.c",
+    "sha256": "c37d7aa82c48890bf37544ea8306487debacf34b416f01ba2d48cdf29515c1cb"
+  },
+  {
+    "path": "src/candidate.cpp",
+    "sha256": "6846f66c0980f062e36ed9cae48f2b41f7f79f0904011755b243b0aab03d1657"
+  }
+]

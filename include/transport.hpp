@@ -6,7 +6,8 @@
 
 namespace uu {
 class Api {
-    std::string key_, client_, device_, token_, user_;
+    std::string key_, client_, device_, token_, user_, nickname_;
+    bool sessionSaved_=false;
     std::atomic<bool> &cancel_;
 
   public:
@@ -16,10 +17,11 @@ class Api {
                  int timeout = 20000);
     void initialize();
     void login(const Json &result);
-    void logout() {
-        token_.clear();
-        user_.clear();
-    }
+    void logout();
+    bool restoreSession();
+    bool saveSession();
+    bool sessionSaved()const{return sessionSaved_;}
+    const std::string &nickname()const{return nickname_;}
     bool authenticated() const {
         return !token_.empty();
     }
