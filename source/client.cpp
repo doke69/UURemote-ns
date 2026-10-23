@@ -473,10 +473,15 @@ void Client::handle(const Event &event) {
     }
     if(e=="quality-screens") {
         const int screen=data.at("screen").get<int>();
+        // An unresolved inventory must not wipe a known id or look like a switch.
+        if(screen<0 && activeScreenId_>=0){diagnostic("quality-screen-id-unresolved");return;}
         if(screen!=activeScreenId_){
+            const int previous=activeScreenId_;
             activeScreenId_=screen;
             diagnostic(("quality-current-screen-"+std::to_string(screen)+"-count-"+std::to_string(data.at("count").get<unsigned>())).c_str());
-            if(pendingQuality_ && pendingQuality_->screenId!=screen)
+            // Hot FPS/quality uses screen_id -1 (current capture). Only a move
+            // between two concrete monitors invalidates an in-flight request.
+            if(pendingQuality_ && previous>=0 && screen>=0 && pendingQuality_->screenId>=0 && pendingQuality_->screenId!=screen)
                 fallbackQuality("电脑屏幕已变化，正在重新连接…");
         }
     } else if (e == "quality-settings") {
@@ -495,34 +500,46 @@ void Client::handle(const Event &event) {
         const QualityValues target{width,height,fps,quality,maxBitrate,playoutDelay,vsync,hevc};
         const bool captureChanged=width!=streamWidth_ || height!=streamHeight_ || fps!=streamFps_ || quality!=streamQuality_;
         const bool capChanged=maxBitrate!=maxBitrateMbps_;
-        const bool streamChanged=captureChanged || capChanged || hevc!=hevc_;
-        if(!peer_ || (!snapshot().streaming && !streamChanged)){commitQuality(target,false,"设置已保存，连接时应用");return;}
-        if(!snapshot().streaming){reconnectQuality(target,"正在重新连接以应用设置…");return;}
-        if(hevc!=hevc_ || (capChanged && maxBitrate==0) || (capChanged && !rembAvailable_)){
-            reconnectQuality(target,"正在重新连接以应用编码或码率设置…");return;
+        const char *channelName=nullptr;
+        std::shared_ptr<rtc::DataChannel> channel;
+        // TEXT is the channel this client already uses for capture RPCs. CONTROL is
+        // the fallback when TEXT is not open; replies are accepted on both.
+        for(const char *name:{"TEXT_DATA_CHANNEL","CONTROL_DATA_CHANNEL"}){
+            auto found=channels_.find(name);
+            if(found!=channels_.end() && found->second->isOpen() && found->second->bufferedAmount()<=65536){
+                channel=found->second;channelName=name;break;
+            }
         }
-        if(!captureChanged){
-            try{commitQuality(target,capChanged,streamChanged?"码率反馈已在线更新":"显示设置已更新");}
+        const auto plan=planQualityApply({peer_!=nullptr,snapshot().streaming,captureChanged,hevc!=hevc_,capChanged,
+            maxBitrate,rembAvailable_,channel!=nullptr});
+        diagnostic(qualityApplyReasonText(plan.reason));
+        if(plan.action==QualityApply::Save){commitQuality(target,false,"设置已保存，连接时应用");return;}
+        if(plan.action==QualityApply::Reconnect){
+            const char *notice="正在重新连接以应用设置…";
+            if(plan.reason==QualityApplyReason::ReconnectCodec || plan.reason==QualityApplyReason::ReconnectBitrate)
+                notice="正在重新连接以应用编码或码率设置…";
+            else if(plan.reason==QualityApplyReason::ReconnectChannel)
+                notice="设置通道尚未就绪，正在重连应用…";
+            reconnectQuality(target,notice);return;
+        }
+        if(plan.action==QualityApply::Local){
+            try{commitQuality(target,capChanged,plan.reason==QualityApplyReason::LocalBitrate?"码率反馈已在线更新":"显示设置已更新");}
             catch(...){reconnectQuality(target,"在线更新未完成，正在重连应用…");}
             return;
         }
-        const auto it=channels_.find("TEXT_DATA_CHANNEL");
-        if(it==channels_.end() || !it->second->isOpen() || it->second->bufferedAmount()>65536){
-            reconnectQuality(target,"设置通道尚未就绪，正在重连应用…");return;
-        }
-        if(activeScreenId_<0){
-            diagnostic("quality-current-screen-unavailable");
-            reconnectQuality(target,"尚未收到电脑屏幕信息，正在重连应用…");return;
-        }
+        // Current capture. A concrete screen id is a monitor switch and is not
+        // selected from this menu; missing Main.screens must not tear the peer down.
+        const int screenId=kCurrentCaptureScreen;
         const auto id=nextQualityRpc_++;
-        const auto bytes=captureSettingsRpc(id,width,height,fps,quality,activeScreenId_);
-        pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,activeScreenId_};
+        const auto bytes=captureSettingsRpc(id,width,height,fps,quality,screenId);
+        pendingQuality_=PendingQuality{target,id,monotonicMs()+5000,false,false,screenId};
         {std::lock_guard lock(stateMutex_);state_.qualityPending=true;state_.qualityNotice="正在等待电脑确认画质…";}
         try{
-            if(!it->second->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size())){
+            if(!channel->send(reinterpret_cast<const std::byte *>(bytes.data()),bytes.size())){
                 fallbackQuality("设置发送受阻，正在重连应用…");return;
             }
-            ++qualitySent_;diagnostic(("quality-rpc-sent-"+std::to_string(id)).c_str());
+            ++qualitySent_;
+            diagnostic((std::string("quality-rpc-sent-")+(channelName&&channelName[0]=='C'?"control-":"text-")+std::to_string(id)).c_str());
         }catch(...){fallbackQuality("设置发送失败，正在重连应用…");}
     } else if(e=="quality-rpc-ack") {
         if(!pendingQuality_ || pendingQuality_->acknowledged || data.at("id").get<uint64_t>()!=pendingQuality_->id)return;
@@ -532,19 +549,42 @@ void Client::handle(const Event &event) {
         // Log only bounded numeric metadata, never remote strings or payloads.
         diagnostic(("quality-rpc-response-capture-"+std::to_string(capture)+
                     "-entries-"+std::to_string(data.value("entries",0u))+"-errors-"+std::to_string(errors)+"-code-"+std::to_string(data.value("code",0))+
-                    "-other-"+std::to_string(other)).c_str());
-        if(errors || other){
+                    "-other-"+std::to_string(other)+"-payload-"+std::to_string(data.value("payload_extras",0u))).c_str());
+        CaptureRpcAck ack;
+        ack.requestId=data.at("id").get<uint64_t>();ack.errors=errors;ack.capture=capture;
+        ack.payloadExtras=data.value("payload_extras",0u);
+        if(captureAckRefused(ack)){
             diagnostic("quality-rpc-response-not-accepted");
             fallbackQuality("电脑未确认在线设置，正在重连应用…");return;
         }
-        // Original CaptureSettingResp leaves errors empty when the optional
-        // capture body is absent. A matching header-only reply is an RPC
-        // acknowledgment, not evidence of actual encoder FPS or quality.
+        // CaptureSettingResp may omit the capture body. That is an RPC ack,
+        // not proof the encoder adopted the rate. A later CaptureSettingSync
+        // (Message 25) is the host's applied fps/quality. Absence of that sync
+        // does not reconnect: the peer stays up and the panel still shows the
+        // requested rate beside the measured decode rate.
         pendingQuality_->headerOnly=!capture;
         ++qualityAcked_;pendingQuality_->acknowledged=true;pendingQuality_->deadline=monotonicMs()+5000;
-        diagnostic(("quality-rpc-acked-"+std::to_string(pendingQuality_->id)).c_str());
+        diagnostic((std::string(pendingQuality_->headerOnly?"quality-rpc-acked-header-":"quality-rpc-acked-capture-")+std::to_string(pendingQuality_->id)).c_str());
         if(video_)video_->requestKeyframe();
         finishQuality();
+    } else if(e=="quality-sync") {
+        const bool hasFps=data.value("fps_set",false),hasQuality=data.value("quality_set",false);
+        const int fps=data.value("fps",-1),quality=data.value("quality",-1);
+        const int wantFps=pendingQuality_?pendingQuality_->target.fps:streamFps_;
+        const int wantQuality=pendingQuality_?pendingQuality_->target.quality:streamQuality_;
+        const bool matches=(!hasFps || fps==wantFps) && (!hasQuality || quality==wantQuality);
+        diagnostic(matches?"quality-sync-matches":"quality-sync-differs");
+        // A differing sync can be the pre-change report, or a monitor refresh
+        // rather than the encoder rate. Do not tear the peer down for it.
+        if(pendingQuality_){
+            pendingQuality_->syncSeen=true;
+            if(hasFps)pendingQuality_->syncFps=fps;
+            if(hasQuality)pendingQuality_->syncQuality=quality;
+            if(pendingQuality_->acknowledged)finishQuality();
+        }else if(matches && hasFps && hasQuality){
+            std::lock_guard lock(stateMutex_);
+            if(state_.qualityNotice=="电脑已应答画质设置")state_.qualityNotice="电脑已同步帧率与画质";
+        }
     } else if(e=="startup"){
         cancel_=false;
         if(!api_->restoreSession()){post("login");return;}
@@ -1049,7 +1089,7 @@ void Client::beginPeer(const Json &result) {
                               "FILE_DATA_CHANNEL", "BINARY_DATA_CHANNEL"}) {
         auto channel=peer_->createDataChannel(label);channels_[label]=channel;
         {
-            const bool acceptRpc=std::string(label)=="TEXT_DATA_CHANNEL" || std::string(label)=="FILE_DATA_CHANNEL";
+            const bool acceptRpc=std::string(label)=="CONTROL_DATA_CHANNEL" || std::string(label)=="TEXT_DATA_CHANNEL" || std::string(label)=="FILE_DATA_CHANNEL";
             std::weak_ptr<Inbox> inbox=inbox_;const auto generation=generation_;
             channel->onMessage([inbox,generation,acceptRpc](rtc::message_variant message) {
                 const uint8_t *bytes=nullptr;size_t size=0;
@@ -1057,12 +1097,14 @@ void Client::beginPeer(const Json &result) {
                 else if(auto *text=std::get_if<std::string>(&message)){bytes=reinterpret_cast<const uint8_t *>(text->data());size=text->size();}
                 const auto screens=parseScreenSources(bytes,size);
                 const auto ack=acceptRpc?parseCaptureRpcAck(bytes,size):std::optional<CaptureRpcAck>{};
-                if(!screens && !ack)return;
+                const auto sync=acceptRpc?parseCaptureSettingSync(bytes,size):std::optional<CaptureSettingSync>{};
+                if(!screens && !ack && !sync)return;
                 if(auto queue=inbox.lock()){
                     std::lock_guard lock(queue->mutex);
                     if(queue->events.size()>=127)return;
                     if(screens)queue->events.push_back({"quality-screens",{{"screen",screens->screenId},{"count",screens->count}},generation});
-                    if(ack)queue->events.push_back({"quality-rpc-ack",{{"id",ack->requestId},{"capture",ack->capture},{"errors",ack->errors},{"entries",ack->entries},{"code",ack->errorCode},{"other",ack->otherFields}},generation});
+                    if(ack)queue->events.push_back({"quality-rpc-ack",{{"id",ack->requestId},{"capture",ack->capture},{"errors",ack->errors},{"entries",ack->entries},{"code",ack->errorCode},{"other",ack->otherFields},{"payload_extras",ack->payloadExtras}},generation});
+                    if(sync)queue->events.push_back({"quality-sync",{{"fps",sync->fps},{"quality",sync->quality},{"width",sync->width},{"height",sync->height},{"fps_set",sync->hasFps},{"quality_set",sync->hasQuality}},generation});
                     queue->cv.notify_one();
                 }
             });
@@ -1318,9 +1360,10 @@ void Client::finishQuality() {
     if(!pendingQuality_ || !pendingQuality_->acknowledged)return;
     const auto q=pendingQuality_->target;const auto media=media_->stats();
     if((q.width!=streamWidth_ || q.height!=streamHeight_) && (media.width!=q.width || media.height!=q.height))return;
+    const bool synced=pendingQuality_->syncSeen && pendingQuality_->syncFps==q.fps && pendingQuality_->syncQuality==q.quality;
     try {
-        commitQuality(q,q.cap!=maxBitrateMbps_,"电脑已应答画质设置");
-        diagnostic(pendingQuality_->headerOnly?"quality-rpc-header-only-committed":"quality-rpc-capture-committed");
+        commitQuality(q,q.cap!=maxBitrateMbps_,synced?"电脑已同步帧率与画质":"电脑已应答画质设置");
+        diagnostic(synced?"quality-sync-committed":pendingQuality_->headerOnly?"quality-rpc-header-only-committed":"quality-rpc-capture-committed");
         pendingQuality_.reset();
     }catch(...){fallbackQuality("在线设置未完成，正在重连应用…");}
 }

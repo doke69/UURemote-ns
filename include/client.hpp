@@ -73,7 +73,10 @@ class Client {
     int64_t lastBitrateAttempt_ = 0;
     void applyBitrateCap();
     struct QualityValues {int width,height,fps,quality,cap,delay;bool vsync,hevc;};
-    struct PendingQuality {QualityValues target;uint64_t id;int64_t deadline;bool acknowledged=false;bool headerOnly=false;int screenId=-1;};
+    struct PendingQuality {
+        QualityValues target;uint64_t id;int64_t deadline;bool acknowledged=false;bool headerOnly=false;int screenId=-1;
+        bool syncSeen=false;int syncFps=-1,syncQuality=-1;
+    };
     std::optional<PendingQuality> pendingQuality_;
     uint64_t nextQualityRpc_=1,qualitySent_=0,qualityAcked_=0,qualityFailed_=0;
     int activeScreenId_=-1,lastQualityCode_=0;unsigned lastQualityErrors_=0;

@@ -55,13 +55,18 @@ Bytes simpleActionMessage(uint64_t seq,unsigned action,std::optional<bool> enabl
     integer(out,1,seq);integer(out,2,nowMs());message(out,3,body);return out;
 }
 Bytes captureSettingsRpc(uint64_t id,int w,int h,int fps,int quality,int screenId){
-    if(!id || screenId<0 || !((w==960&&h==540)||(w==1280&&h==720)||(w==1920&&h==1080)) ||
+    if(!id || screenId<-1 || !((w==960&&h==540)||(w==1280&&h==720)||(w==1920&&h==1080)) ||
        (fps!=30&&fps!=60) || quality<1 || quality>5)throw std::invalid_argument("Invalid capture settings");
     Bytes capture,header,rpc,out;
+    // rpc_main CaptureSettingRequest: 1 fps option (1=30, 2=60), 2 quality,
+    // 3 cursor_capture, 4 screen_id, 5/6 resolution, 18 fps_count (the rate).
+    // Field 1 alone is an index. Hosts that read fps_count ignore a missing 18,
+    // which left the encoder on the connect-time rate. -1 is the current
+    // capture (phone hot-apply); a listed id switches monitors.
     integer(capture,1,fps==30?1:2);integer(capture,2,quality);integer(capture,3,1);
-    // Connect auto-selection (-1) is not a valid online target. Use the
-    // current ID advertised in Main.screens and validated against its list.
-    integer(capture,4,unsigned(screenId));integer(capture,5,w);integer(capture,6,h);
+    integer(capture,4,uint64_t(int64_t(screenId)));
+    integer(capture,5,unsigned(w));integer(capture,6,unsigned(h));
+    integer(capture,18,unsigned(fps));
     // Do not guess private custom-bitrate units or change chroma settings.
     integer(header,1,id);message(rpc,1,header);message(rpc,2,capture);
     integer(out,1,id);integer(out,2,nowMs());message(out,21,rpc);return out;
@@ -96,8 +101,15 @@ std::optional<ScreenSourceInfo> parseScreenSources(const uint8_t *data,size_t si
         if(!sources.good())return {};
         result.count=count;
         // Protobuf's omitted int32 ID is zero; it is accepted only when the
-        // complete advertised list contains that same ID. Never guess a screen.
-        for(unsigned i=0;i<count;++i)if(current>=0 && ids[i]==current)result.screenId=current;
+        // complete advertised list contains that same ID. A single listed
+        // screen with no current id is that capture target. Never guess among
+        // several screens, and never substitute when an explicit id misses.
+        if(currentPresent){
+            for(unsigned i=0;i<count;++i)if(current>=0 && ids[i]==current)result.screenId=current;
+        }else{
+            for(unsigned i=0;i<count;++i)if(ids[i]==0)result.screenId=0;
+            if(result.screenId<0 && count==1)result.screenId=ids[0];
+        }
     }
     if(!outer.good() || !found)return {};
     return result;
@@ -114,7 +126,7 @@ std::optional<CaptureRpcAck> parseCaptureRpcAck(const uint8_t *data,size_t size)
             if(r.key==1){
                 if(header || r.wire!=2)return {};header=true;
                 Reader head(r.data,r.size);Field h;
-                while(head.next(h)){if(h.key==1){if(id || h.wire!=0)return {};id=true;result.requestId=h.value;}else ++result.otherFields;}
+                while(head.next(h)){if(h.key==1){if(id || h.wire!=0)return {};id=true;result.requestId=h.value;}else ++result.headerExtras;}
                 if(!head.good())return {};
             }else if(r.key==2){
                 if(result.capture || r.wire!=2)return {};result.capture=true;
@@ -136,11 +148,74 @@ std::optional<CaptureRpcAck> parseCaptureRpcAck(const uint8_t *data,size_t size)
                     }
                 }
                 if(!capture.good())return {};
-            }else ++result.otherFields;
+            }else ++result.payloadExtras;
         }
         if(!rpc.good())return {};
     }
     if(!outer.good() || !response || !header || !id || !result.requestId)return {};
+    result.otherFields=result.headerExtras+result.payloadExtras;
     return result;
+}
+
+std::optional<CaptureSettingSync> parseCaptureSettingSync(const uint8_t *data,size_t size)noexcept{
+    if(!data || !size || size>65536)return {};
+    CaptureSettingSync result;bool found=false;
+    Reader outer(data,size);Field f;
+    while(outer.next(f))if(f.key==25){
+        if(found || f.wire!=2)return {};
+        found=true;
+        Reader sync(f.data,f.size);Field s;
+        auto assign=[&](bool &present,int &dest)->bool{
+            if(s.wire!=0 || s.value>uint64_t(INT32_MAX) || present)return false;
+            present=true;dest=int(s.value);return true;
+        };
+        while(sync.next(s)){
+            if(s.key==1){if(!assign(result.hasFps,result.fps))return {};}
+            else if(s.key==2){if(!assign(result.hasQuality,result.quality))return {};}
+            else if(s.key==5){if(!assign(result.hasWidth,result.width))return {};}
+            else if(s.key==6){if(!assign(result.hasHeight,result.height))return {};}
+            else if(s.key==9 && s.wire==0 && !result.hasWidth && s.value<=uint64_t(INT32_MAX)){result.hasWidth=true;result.width=int(s.value);}
+            else if(s.key==10 && s.wire==0 && !result.hasHeight && s.value<=uint64_t(INT32_MAX)){result.hasHeight=true;result.height=int(s.value);}
+        }
+        if(!sync.good())return {};
+    }
+    if(!outer.good() || !found || (!result.hasFps && !result.hasQuality))return {};
+    return result;
+}
+
+bool captureAckRefused(const CaptureRpcAck &ack)noexcept{
+    return !ack.requestId || ack.errors || ack.payloadExtras;
+}
+
+QualityApplyPlan planQualityApply(const QualityApplyInput &in)noexcept{
+    const bool streamChanged=in.captureChanged || in.capChanged || in.hevcChanged;
+    if(!in.hasPeer || (!in.streaming && !streamChanged))
+        return {QualityApply::Save,QualityApplyReason::SaveUntilConnect};
+    // No live session yet: the next connect carries ConnectOptions. That is not
+    // a hot apply, and there is no peer connection to preserve.
+    if(!in.streaming) return {QualityApply::Reconnect,QualityApplyReason::ReconnectNotStreaming};
+    // Codec is chosen in SDP. Clearing the cap, or a cap the REMB path cannot
+    // send, cannot be expressed on the open peer.
+    if(in.hevcChanged) return {QualityApply::Reconnect,QualityApplyReason::ReconnectCodec};
+    if(in.capChanged && (in.cap<=0 || !in.rembAvailable))
+        return {QualityApply::Reconnect,QualityApplyReason::ReconnectBitrate};
+    if(!in.captureChanged)
+        return {QualityApply::Local,in.capChanged?QualityApplyReason::LocalBitrate:QualityApplyReason::LocalDisplay};
+    if(!in.channelReady) return {QualityApply::Reconnect,QualityApplyReason::ReconnectChannel};
+    return {QualityApply::Capture,QualityApplyReason::CaptureRpc};
+}
+
+const char *qualityApplyReasonText(QualityApplyReason reason)noexcept{
+    switch(reason){
+    case QualityApplyReason::SaveUntilConnect:return "save-until-connect";
+    case QualityApplyReason::LocalDisplay:return "local-display";
+    case QualityApplyReason::LocalBitrate:return "local-bitrate";
+    case QualityApplyReason::CaptureRpc:return "capture-rpc";
+    case QualityApplyReason::ReconnectNotStreaming:return "reconnect-not-streaming";
+    case QualityApplyReason::ReconnectCodec:return "reconnect-codec";
+    case QualityApplyReason::ReconnectBitrate:return "reconnect-bitrate";
+    case QualityApplyReason::ReconnectChannel:return "reconnect-channel";
+    }
+    return "quality-apply-unknown";
 }
 }
