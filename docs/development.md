@@ -1,5 +1,35 @@
 # 开发记录
 
+## 当前架构与阅读方式
+
+此节更新于 2026-10-23，依据本地 v0.1.57。公开主分支与本地候选的差异见[项目状态](project-status.md)。下方保留历史记录（本机路径示例已泛化），旧版本的 RGBA 显示路径和“尚未接通”结论不应直接套用到当前候选。
+
+```text
+Switch 原生界面 / 手柄 / 触屏
+  ├─ HTTPS API：登录、设备、房间
+  ├─ TLS WebSocket / Socket.IO：信令
+  └─ libdatachannel：ICE / DTLS / SRTP / SCTP
+       ├─ 视频：RTP/RTX → 组帧、补包、参考帧恢复
+       │         → H.264 / 实验性 H.265 → FFmpeg NVDEC
+       │         → 硬件帧 NV12 导入与映射缓存 → Deko3D 显示
+       │         （导入/硬件路径不可用时存在 CPU/SDL 回退）
+       ├─ 音频：Opus → PCM → 播放
+       └─ 控制：键鼠消息 / 虚拟手柄 / 实验性原生触点
+```
+
+- `main.cpp` 处理输入隔离和主循环；`live_frontend.inc` 管理当前菜单、偏好、映射选择；`tv_frontend.inc` 提供共用绘制组件。
+- `client.cpp` 处理登录、设备、连接、控制与画质请求；`quality_rpc.cpp` 编解码画质 RPC。待合并 PR 的改动要单独记录，不能凭应答头就认定编码器已应用目标帧率。
+- `strict_video_receiver.cpp`、`video_assembler.cpp` 及相关反馈路径处理组帧、补包和参考帧恢复。
+- `media.cpp` 与 `native_display.cpp`、`native_nv12.cpp` 分别承担解码、播放调度与原生显示/硬件帧导入。
+- 接收 FPS、解码 FPS、显示提交 FPS 和源端游戏 FPS 不同；解码耗时、网络 RTT、播放缓冲也不是端到端操作延迟。分析时保留这些边界。
+- GPU NV12 路径已有正向真机反馈，但仍有回退和资源生命周期限制，不能简化为“所有路径绝对零拷贝”。
+
+当前需要继续验证的项目、暂停研究及使用边界集中维护在[功能状态表](project-status.md)。贡献者还可阅读[构建说明](build-v52.md)、[PR1 审核记录](reviews/v52-review.md)。
+
+## 历史开发记录
+
+以下为早期实现与故障处理原记录，结论以对应版本为准。
+
 ## 结构
 
 ```text
@@ -121,8 +151,8 @@ Switch 最终链接通过 `--wrap=sslConnectionRead` / `--wrap=sslConnectionWrit
   dns.mitm 的 c-ares 拦截与 fs.mitm 的 BatchRead 支持，hbmenu 3.6.1 / hbl 2.4.5 为其自带版本。
 - 构建锁定 SDK 补入了原 `sdk-windows.lock.json` 遗漏的 portlibs：`switch-libopus`、`switch-bzip2`、`switch-libdrm_nouveau`、
   `switch-libfribidi`（否则链接 `-lopus` / `-lbz2` / `-ldrm_nouveau` 失败）。
-- Windows 上 devkitA64 binutils 无法打开含非 ASCII 字符的绝对路径，构建需通过纯 ASCII 目录联接（如 `mklink /J C:\uu\repo ...`）
-  并把 `TEMP`/`TMP` 指向 ASCII 目录；详见 README「源码构建」注意事项。
+- Windows 上 devkitA64 binutils 无法打开含非 ASCII 字符的绝对路径，构建需通过纯 ASCII 目录联接（可通过 `mklink /J` 创建纯 ASCII 路径入口）
+  并把 `TEMP`/`TMP` 指向 ASCII 目录；详见源码构建文档注意事项。
 
 ## v0.1.8 花屏修复
 
